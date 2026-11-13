@@ -4,7 +4,7 @@ Read passwords from a local Bramble desktop vault using a manually unsealed, sin
 
 ## Build
 
-Rust and Cargo are required. On Nix, `nix-shell nix/shell.nix --run 'just build'` supplies the toolchain. Otherwise run `just build` with Rust, Cargo and [just](https://just.systems/) installed. The binary is `target/release/bramble-cli`. Cargo fetches the Bramble crypto core from the exact revision recorded in `Cargo.lock`; an initial build needs network access. `just test` runs the synthetic-vault integration test; `just check` checks formatting and compilation.
+Rust and Cargo are required. On Nix, `nix-shell nix/shell.nix --run 'just build'` supplies the toolchain. Otherwise run `just build` with Rust, Cargo and [just](https://just.systems/) installed. The binary is `cli/target/release/bramble-cli`. Cargo fetches the Bramble crypto core from the exact revision recorded in `cli/Cargo.lock`; an initial build needs network access. `just test` runs the synthetic-vault integration test; `just check` checks formatting and compilation.
 
 ## Use
 

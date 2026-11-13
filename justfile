@@ -4,17 +4,17 @@ default:
 
 # Build the release binary.
 build:
-    cargo build --release --locked
+    cd cli && cargo build --release --locked
 
 # Run the test suite.
 test:
-    cargo test --locked
+    cd cli && cargo test --locked
 
 # Check formatting and compilation.
 check:
-    cargo fmt --check
-    cargo check --locked
+    cd cli && cargo fmt --check
+    cd cli && cargo check --locked
 
 # Format the Rust sources.
 fmt:
-    cargo fmt
+    cd cli && cargo fmt
