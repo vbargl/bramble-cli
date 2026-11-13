@@ -19,11 +19,12 @@ In another terminal:
 ```sh
 bramble-cli status
 bramble-cli unseal
+bramble-cli list
 bramble-cli get ENTRY_ID
 bramble-cli seal
 ```
 
-`get` prints the password to standard output. Protect terminal output and any pipes or files receiving it. The entry selector is Bramble's exact entry ID; this initial version does not list or search entries. The daemon rereads the vault file for each request. It does not modify it. If the vault key changes externally, restart and unseal again.
+`get` prints the password to standard output. Protect terminal output and any pipes or files receiving it. `list` prints a JSON array of entry IDs and names; `get` selects by exact ID. The daemon rereads the vault file for each request. It does not modify it. If the vault key changes externally, restart and unseal again.
 
 By default the socket is `$XDG_RUNTIME_DIR/bramble-cli/socket`; `--socket PATH` or `BRAMBLE_SOCKET` selects another path. All commands must use the same path. The socket's parent must be a directory owned by the current user with no group or other access. The socket is mode 0600. If a daemon terminates, its socket file may remain; after ensuring no daemon is running, remove that file before restarting.
 

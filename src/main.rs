@@ -29,6 +29,7 @@ enum Command {
     Unseal,
     Seal,
     Status,
+    List,
     Get { id: String },
 }
 #[derive(Serialize, Deserialize)]
@@ -37,6 +38,7 @@ enum Request {
     Unseal { password: String },
     Seal,
     Status,
+    List,
     Get { id: String },
 }
 #[derive(Serialize, Deserialize)]
@@ -124,12 +126,12 @@ fn unlock(v: &Vault, password: &str) -> Result<bool, String> {
     }
     Ok(false)
 }
-fn get(v: &Vault, id: &str) -> Result<String, String> {
+fn entries(v: &Vault) -> Result<Vec<serde_json::Value>, String> {
     if vault_crypto::is_locked() {
         return Err("daemon is sealed".into());
     }
     if v.ciphertext.is_empty() {
-        return Err("entry not found".into());
+        return Ok(Vec::new());
     }
     let mut outer = vault_crypto::decrypt_with_vek(b64.encode(&v.iv), b64.encode(&v.ciphertext))
         .map_err(|e| e.to_string())?;
@@ -141,10 +143,9 @@ fn get(v: &Vault, id: &str) -> Result<String, String> {
         .and_then(|x| x.as_array())
         .or_else(|| payload.as_array())
         .ok_or("invalid entries payload")?;
-    let entry = entries
-        .iter()
-        .find(|x| x.get("id").and_then(|v| v.as_str()) == Some(id))
-        .ok_or("entry not found")?;
+    Ok(entries.clone())
+}
+fn decrypt(entry: &serde_json::Value) -> Result<serde_json::Value, String> {
     let field = |name| {
         entry
             .get(name)
@@ -161,9 +162,17 @@ fn get(v: &Vault, id: &str) -> Result<String, String> {
     .map_err(|e| e.to_string())?;
     let value: Result<serde_json::Value, _> = serde_json::from_str(&plain);
     plain.zeroize();
-    let mut value = value.map_err(|_| "invalid decrypted entry")?;
+    value.map_err(|_| "invalid decrypted entry".into())
+}
+fn get(v: &Vault, id: &str) -> Result<String, String> {
+    let entries = entries(v)?;
+    let entry = entries
+        .iter()
+        .find(|x| x.get("id").and_then(|v| v.as_str()) == Some(id))
+        .ok_or("entry not found")?;
+    let mut value = decrypt(entry)?;
     let password = value
-        .get_mut("password")
+        .get("password")
         .and_then(|v| v.as_str())
         .ok_or("entry has no password")?
         .to_owned();
@@ -172,6 +181,23 @@ fn get(v: &Vault, id: &str) -> Result<String, String> {
     }
     Ok(password)
 }
+fn list(v: &Vault) -> Result<String, String> {
+    let mut result = Vec::new();
+    for entry in entries(v)? {
+        let id = entry
+            .get("id")
+            .and_then(|x| x.as_str())
+            .ok_or("invalid entry id")?;
+        let mut value = decrypt(&entry)?;
+        let name = value.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        result.push(serde_json::json!({"id": id, "name": name}));
+        if let Some(serde_json::Value::String(s)) = value.get_mut("password") {
+            s.zeroize();
+        }
+    }
+    serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
 fn handle(req: Request, vault: &Path) -> Response {
     match req {
         Request::Status => ok(if vault_crypto::is_locked() {
@@ -196,6 +222,10 @@ fn handle(req: Request, vault: &Path) -> Response {
                 Err(e) => fail(e),
             }
         }
+        Request::List => match read_vault(vault).and_then(|v| list(&v)) {
+            Ok(x) => ok(x),
+            Err(e) => fail(e),
+        },
         Request::Get { id } => match read_vault(vault).and_then(|v| get(&v, &id)) {
             Ok(x) => ok(x),
             Err(e) => fail(e),
@@ -266,6 +296,7 @@ fn run() -> Result<(), String> {
         },
         Command::Seal => Request::Seal,
         Command::Status => Request::Status,
+        Command::List => Request::List,
         Command::Get { id } => Request::Get { id },
     };
     let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;

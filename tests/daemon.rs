@@ -22,7 +22,7 @@ fn fixture(path: &Path) {
     )
     .unwrap();
     let entry = vault_crypto::encrypt_entry(
-        json!({"type":"login","password":"synthetic-password"}).to_string(),
+        json!({"type":"login","name":"Example","password":"synthetic-password"}).to_string(),
     )
     .unwrap();
     let mut entry = serde_json::to_value(entry).unwrap();
@@ -93,6 +93,10 @@ fn lifecycle_with_upstream_vault() {
     assert_eq!(
         request(&socket, json!({"op":"unseal","password":"correct"}))["ok"],
         true
+    );
+    assert_eq!(
+        request(&socket, json!({"op":"list"}))["message"],
+        r#"[{"id":"entry-1","name":"Example"}]"#
     );
     for _ in 0..2 {
         assert_eq!(
