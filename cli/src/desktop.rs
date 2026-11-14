@@ -174,7 +174,12 @@ fn accepted(value: Value) -> Result<Value, String> {
 }
 
 impl Session {
-    fn start(path: &Path, start: noise::StartResult, hello: Value) -> Result<Self, String> {
+    fn start(
+        path: &Path,
+        start: noise::StartResult,
+        hello: Value,
+        connected: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Self, String> {
         // Close the crypto session even if connecting or the handshake fails.
         let stream = match UnixStream::connect(path) {
             Ok(s) => s,
@@ -188,6 +193,7 @@ impl Session {
             id: start.session_id,
         };
         session.timeout(Duration::from_secs(5))?;
+        connected()?;
         write_frame(&mut session.stream, &hello)?;
         write_frame(&mut session.stream, &json!({"message": start.message}))?;
         let reply = accepted(read_frame(&mut session.stream)?)?;
@@ -220,17 +226,28 @@ impl Session {
             socket,
             start,
             json!({"kind":"hello", "v":1, "publicKey":identity.public_key}),
+            || Ok(()),
         )
     }
 
     pub fn request(&mut self, body: Value) -> Result<Value, String> {
+        accepted(self.request_raw(body)?)
+    }
+
+    // Keep authenticated refusals structured so the interactive guide can distinguish a
+    // locked vault from a revoked pairing without guessing from an I/O error string.
+    pub fn request_raw(&mut self, body: Value) -> Result<Value, String> {
         let plain = Zeroizing::new(body.to_string());
         let sealed = crypto(noise::handshake_encrypt(self.id, plain.to_string()))?;
-        write_frame(&mut self.stream, &json!({"sealed": sealed}))?;
+        // A revoked connection can already have a sealed refusal queued after the
+        // handshake, followed by EOF. Read that authenticated refusal even if our write
+        // races the close; otherwise revocation looks like an unhelpful broken pipe.
+        let sent = write_frame(&mut self.stream, &json!({"sealed": sealed}));
         // The desktop may push sync offers or page-fill events. They share Noise's nonce
         // sequence, so decrypt every frame, even though this client never syncs or fills pages.
         for _ in 0..64 {
-            let frame = read_frame(&mut self.stream)?;
+            let frame = read_frame(&mut self.stream)
+                .map_err(|e| sent.as_ref().err().cloned().unwrap_or(e))?;
             let plain = Zeroizing::new(crypto(noise::handshake_decrypt(
                 self.id,
                 field(&frame, "sealed")?,
@@ -238,7 +255,12 @@ impl Session {
             let value: Value =
                 serde_json::from_str(&plain).map_err(|_| "invalid desktop answer")?;
             if value.get("ok").is_some() {
-                return accepted(value);
+                if value["ok"] == true {
+                    if let Err(e) = &sent {
+                        return Err(e.clone());
+                    }
+                }
+                return Ok(value);
             }
         }
         Err("desktop sent too many unsolicited frames".into())
@@ -268,11 +290,17 @@ fn sas_digits(material: &[u8]) -> String {
     format!("{} {} {}", &digits[..4], &digits[4..8], &digits[8..])
 }
 
+pub enum PairEvent<'a> {
+    Connected,
+    Compare(&'a str),
+    AwaitingDesktop,
+}
+
 /// The caller compares the SAS with the desktop UI. Never auto-approve this check.
 pub fn pair(
     socket: &Path,
     path: &Path,
-    confirm: impl FnOnce(&str) -> Result<bool, String>,
+    mut progress: impl FnMut(PairEvent<'_>) -> Result<bool, String>,
 ) -> Result<(), String> {
     crate::private_dir(
         path.parent()
@@ -295,6 +323,7 @@ pub fn pair(
         socket,
         start?,
         json!({"kind":"link", "v":1, "label":"Bramble CLI"}),
+        || progress(PairEvent::Connected).map(|_| ()),
     )?;
     let mut nonce = [0; 32];
     getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
@@ -312,9 +341,10 @@ pub fn pair(
         .map_err(|_| "invalid handshake hash")?;
     identity.app_public_key = crypto(noise::handshake_remote_static(session.id))?;
     let digits = sas_digits(&sas_material(&hash, &desktop_nonce, &nonce));
-    if !confirm(&digits)? {
+    if !progress(PairEvent::Compare(&digits))? {
         return Err("pairing cancelled; desktop identity was not saved".into());
     }
+    progress(PairEvent::AwaitingDesktop)?;
     session.timeout(Duration::from_secs(180))?;
     let answer = session.request(json!({"op":"linkConfirm"}))?;
     if answer["paired"] != true {

@@ -16,6 +16,7 @@ struct Desktop {
     root: tempfile::TempDir,
     socket: PathBuf,
     locked: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
     revoked: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     key: Arc<Mutex<Option<String>>>,
@@ -30,6 +31,8 @@ impl Desktop {
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let locked = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(true));
+        let prepared = ready.clone();
         let revoked = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let key = Arc::new(Mutex::new(None));
@@ -52,7 +55,16 @@ impl Desktop {
                         stream
                             .set_write_timeout(Some(Duration::from_secs(3)))
                             .unwrap();
-                        let _ = serve(&mut stream, &kp, &k, &verification, &l, &r, approve);
+                        let _ = serve(
+                            &mut stream,
+                            &kp,
+                            &k,
+                            &verification,
+                            &l,
+                            &r,
+                            &prepared,
+                            approve,
+                        );
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5))
@@ -65,6 +77,7 @@ impl Desktop {
             root,
             socket,
             locked,
+            ready,
             revoked,
             stop,
             key,
@@ -76,8 +89,10 @@ impl Desktop {
         self.root.path().join("client.json")
     }
     fn pair(&self) {
-        desktop::pair(&self.socket, &self.identity(), |digits| {
-            assert_eq!(self.sas.lock().unwrap().as_deref(), Some(digits));
+        desktop::pair(&self.socket, &self.identity(), |event| {
+            if let desktop::PairEvent::Compare(digits) = event {
+                assert_eq!(self.sas.lock().unwrap().as_deref(), Some(digits));
+            }
             Ok(true)
         })
         .unwrap();
@@ -121,11 +136,15 @@ fn serve(
     sas: &Mutex<Option<String>>,
     locked: &AtomicBool,
     revoked: &AtomicBool,
+    ready: &AtomicBool,
     approve: bool,
 ) -> Result<(), String> {
     let hello = read_frame(stream)?;
     assert_eq!(hello["v"], 1);
     let linking = hello["kind"] == "link";
+    if linking && !ready.load(Ordering::SeqCst) {
+        return write_frame(stream, &json!({"ok":false,"error":"refused","done":false}));
+    }
     let id = if linking {
         assert_eq!(hello["label"], "Bramble CLI");
         noise::handshake_link_responder(kp.private_key.clone())
@@ -261,7 +280,13 @@ fn desktop_pairing_and_authentication() {
 #[test]
 fn pairing_requires_both_confirmations() {
     let desktop = Desktop::new(true);
-    assert!(desktop::pair(&desktop.socket, &desktop.identity(), |_| Ok(false)).is_err());
+    assert!(
+        desktop::pair(&desktop.socket, &desktop.identity(), |event| Ok(!matches!(
+            event,
+            desktop::PairEvent::Compare(_)
+        )))
+        .is_err()
+    );
     assert!(!desktop.identity().exists());
     assert!(desktop.key.lock().unwrap().is_none());
     let desktop = Desktop::new(false);
@@ -469,4 +494,128 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
         )
         .ok
     );
+}
+
+struct BeforeInput<F> {
+    inner: std::io::Cursor<Vec<u8>>,
+    before: F,
+}
+impl<F: FnMut()> Read for BeforeInput<F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+impl<F: FnMut()> BufRead for BeforeInput<F> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        (self.before)();
+        self.inner.fill_buf()
+    }
+    fn consume(&mut self, amount: usize) {
+        self.inner.consume(amount);
+    }
+}
+
+#[test]
+fn guide_waits_for_desktop_preparation_then_pairs() {
+    let desktop = Desktop::new(true);
+    desktop.ready.store(false, Ordering::SeqCst);
+    let mut input = BeforeInput {
+        inner: std::io::Cursor::new(b"\nyes\n".to_vec()),
+        before: || {
+            desktop.ready.store(true, Ordering::SeqCst);
+        },
+    };
+    let mut output = Vec::new();
+    pairing_ui::run(
+        &desktop.socket,
+        &desktop.identity(),
+        &mut input,
+        &mut output,
+    )
+    .unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("✅ Local desktop connection opened"));
+    assert!(output.contains("⏳ In desktop Bramble, unlock the intended vault"));
+    assert!(output.contains("Press Enter when ready to retry"));
+    assert!(output.contains("🔒 Compare the pairing digits"));
+    assert!(output.contains("⏳ Click Approve in desktop Bramble"));
+    assert!(output.ends_with("✅ Pairing saved; ready to use\n"));
+    assert!(desktop.identity().exists());
+}
+
+#[test]
+fn guide_handles_missing_desktop_and_closed_input_without_claiming_success() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    for input in [b"q\n".as_slice(), b""] {
+        let mut output = Vec::new();
+        let error = pairing_ui::run(
+            &root.path().join("absent.sock"),
+            &root.path().join("client.json"),
+            &mut std::io::Cursor::new(input),
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"));
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("⏳ Open desktop Bramble"));
+        assert!(!output.contains("✅ Local desktop connection opened"));
+        assert!(!output.contains("✅ Pairing saved"));
+        assert!(!root.path().join("client.json").exists());
+    }
+}
+
+#[test]
+fn guide_checks_existing_pairing_and_waits_for_unlock_without_replacing_credentials() {
+    let desktop = Desktop::new(true);
+    desktop.pair();
+    let before = fs::read(desktop.identity()).unwrap();
+    desktop.locked.store(true, Ordering::SeqCst);
+    let mut input = BeforeInput {
+        inner: std::io::Cursor::new(b"\n".to_vec()),
+        before: || {
+            desktop.locked.store(false, Ordering::SeqCst);
+        },
+    };
+    let mut output = Vec::new();
+    pairing_ui::run(
+        &desktop.socket,
+        &desktop.identity(),
+        &mut input,
+        &mut output,
+    )
+    .unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("✅ Existing pairing credentials found"));
+    assert!(output.contains("⏳ Unlock the paired vault in desktop Bramble"));
+    assert!(output.contains("✅ Existing pairing verified; ready to use"));
+    assert!(before == fs::read(desktop.identity()).unwrap());
+    desktop.revoked.store(true, Ordering::SeqCst);
+    let error = pairing_ui::run(
+        &desktop.socket,
+        &desktop.identity(),
+        &mut std::io::Cursor::new(b""),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.contains("refused the existing pairing"), "{error}");
+    assert!(before == fs::read(desktop.identity()).unwrap());
+}
+
+#[test]
+fn guide_never_treats_enter_as_approval() {
+    let desktop = Desktop::new(true);
+    let mut output = Vec::new();
+    assert!(pairing_ui::run(
+        &desktop.socket,
+        &desktop.identity(),
+        &mut std::io::Cursor::new(b"\n"),
+        &mut output
+    )
+    .unwrap_err()
+    .contains("cancelled"));
+    assert!(!desktop.identity().exists());
+    assert!(!String::from_utf8(output)
+        .unwrap()
+        .contains("✅ Pairing saved"));
 }

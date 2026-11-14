@@ -1,4 +1,5 @@
 mod desktop;
+mod pairing_ui;
 
 use base64::{engine::general_purpose::STANDARD as b64, Engine};
 use clap::{Parser, Subcommand};
@@ -35,7 +36,7 @@ enum Command {
         #[command(flatten)]
         connection: desktop::Options,
     },
-    /// Pair this CLI with the desktop app (open Settings → Connect a browser first).
+    /// Pair with desktop Bramble using an interactive setup checklist.
     Pair {
         #[command(flatten)]
         connection: desktop::Options,
@@ -417,17 +418,12 @@ fn run() -> Result<(), String> {
     // Pairing talks directly to the desktop, so it needs neither a daemon nor XDG_RUNTIME_DIR.
     if let Command::Pair { connection } = &cli.command {
         let (socket, identity) = connection.paths()?;
-        desktop::pair(&socket, &identity, |digits| {
-            eprintln!("Compare with the desktop: {digits}");
-            eprint!("Do all twelve digits match? Type yes to confirm: ");
-            std::io::stderr().flush().map_err(|e| e.to_string())?;
-            let mut answer = String::new();
-            std::io::stdin()
-                .read_line(&mut answer)
-                .map_err(|e| e.to_string())?;
-            Ok(answer.trim() == "yes")
-        })?;
-        println!("paired with desktop");
+        pairing_ui::run(
+            &socket,
+            &identity,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stderr(),
+        )?;
         return Ok(());
     }
     let socket = socket_path(cli.socket)?;

@@ -8,13 +8,17 @@ Rust and Cargo are required. On Nix, `nix-shell nix/shell.nix --run 'just build'
 
 ## Pair with desktop
 
-Open Bramble on this computer, unlock the intended vault, and choose Settings → Browser extension → Connect. Enter the master password there, then run:
+Run pairing first, even if desktop Bramble is not yet open:
 
 ```sh
 bramble-cli pair
 ```
 
-Compare all twelve digits displayed by the CLI with the desktop's digits. Confirm in both places only if they match. Pairing authenticates the desktop and this CLI with Bramble's Noise protocol. It does not copy a vault or join its sync group. The CLI appears as **Bramble CLI** in the desktop's browser connection list; disconnect it there to revoke desktop access.
+The interactive checklist marks completed steps with ✅, the current action with ⏳, and upcoming steps with 🔒. If desktop Bramble is unavailable or refuses pairing, it tells you to open the app, unlock the intended vault and choose Settings → Browser extension → Connect. Enter the master password there and leave the dialog open, then press Enter in the CLI to retry. Type `q` to cancel. The desktop reports a generic refusal when it cannot start pairing, so a refusal does not prove which preparation step is missing; continued refusal may require checking desktop logs.
+
+Compare all twelve digits displayed by the CLI with the desktop's digits. Confirm in both places only if they match. Pairing authenticates the desktop and this CLI with Bramble's Noise protocol. It does not copy a vault or join its sync group. If credentials already exist, `pair` verifies them without replacing them. A locked desktop prompts you to unlock and retry; a revoked pairing reports the recovery steps. Closed input or an empty digit-confirmation response cancels pairing.
+
+The CLI appears as **Bramble CLI** in the desktop's browser connection list; disconnect it there to revoke desktop access.
 
 Start the daemon with the paired desktop enabled and the **same vault's** file as the manual fallback:
 

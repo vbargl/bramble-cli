@@ -188,3 +188,31 @@ fn lifecycle_with_upstream_vault() {
     daemon.kill().unwrap();
     daemon.wait().unwrap();
 }
+
+#[test]
+fn pair_guides_preparation_without_a_daemon_or_runtime_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = dir.path().join("client.json");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+        .env_remove("XDG_RUNTIME_DIR")
+        .args(["pair", "--desktop-socket"])
+        .arg(dir.path().join("missing.sock"))
+        .arg("--pairing-file")
+        .arg(&identity)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"q\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert!(text.contains("✅ CLI ready"));
+    assert!(text.contains("⏳ Open desktop Bramble"));
+    assert!(text.contains("🔒 Compare the pairing digits"));
+    assert!(text.contains("pairing cancelled"));
+    assert!(!text.contains("✅ Pairing saved"));
+    assert!(!identity.exists());
+}
