@@ -17,6 +17,7 @@ struct Desktop {
     socket: PathBuf,
     locked: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
+    switch_on_fetch: Arc<AtomicBool>,
     revoked: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     key: Arc<Mutex<Option<String>>>,
@@ -27,12 +28,17 @@ impl Desktop {
     fn new(approve: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(root.path().join("vaults")).unwrap();
+        fs::write(root.path().join("meta.json"), json!({"active-vault":"vault","vault.registry":{"vaults":[{"id":"vault","label":"Desktop vault"}]}}).to_string()).unwrap();
         let socket = root.path().join("desktop.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let locked = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(true));
         let prepared = ready.clone();
+        let switch_on_fetch = Arc::new(AtomicBool::new(false));
+        let switching = switch_on_fetch.clone();
+        let metadata_path = root.path().join("meta.json");
         let revoked = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let key = Arc::new(Mutex::new(None));
@@ -64,6 +70,15 @@ impl Desktop {
                             &r,
                             &prepared,
                             approve,
+                            &|| {
+                                if switching.swap(false, Ordering::SeqCst) {
+                                    fs::write(
+                                        &metadata_path,
+                                        json!({"active-vault":"other"}).to_string(),
+                                    )
+                                    .unwrap();
+                                }
+                            },
                         );
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -78,6 +93,7 @@ impl Desktop {
             socket,
             locked,
             ready,
+            switch_on_fetch,
             revoked,
             stop,
             key,
@@ -138,6 +154,7 @@ fn serve(
     revoked: &AtomicBool,
     ready: &AtomicBool,
     approve: bool,
+    on_fetch: &dyn Fn(),
 ) -> Result<(), String> {
     let hello = read_frame(stream)?;
     assert_eq!(hello["v"], 1);
@@ -217,6 +234,9 @@ fn serve(
     send(stream, id, json!({"op":"syncOffer"}))?;
     if locked.load(Ordering::SeqCst) {
         return send(stream, id, json!({"ok":false,"error":"locked"}));
+    }
+    if request["op"] == "fetch" {
+        on_fetch();
     }
     let answer = match request["op"].as_str() {
         Some("query") => {
@@ -353,16 +373,12 @@ fn fixture(path: &Path) {
 fn desktop_lock_seal_revocation_and_manual_fallback() {
     let desktop = Desktop::new(true);
     desktop.pair();
-    let vault = desktop.root.path().join("vault.vlt");
+    let vault = desktop.root.path().join("vaults/vault.vlt");
     fixture(&vault);
-    let mut state = State {
-        vault,
-        desktop: Some((desktop.socket.clone(), desktop.identity())),
-        desktop_enabled: true,
-    };
+    let mut state = State::new(Some((desktop.socket.clone(), desktop.identity())));
     assert_eq!(
         handle(Request::Status, &mut state).message,
-        "unsealed (desktop)"
+        "unsealed:\n  Desktop vault (desktop)"
     );
     assert_eq!(
         handle(
@@ -381,7 +397,10 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
         &mut state,
     );
     assert!(list.ok);
-    assert_eq!(list.message, r#"[{"id":"entry-1","name":"Example"}]"#);
+    assert_eq!(
+        list.message,
+        r#"[{"id":"entry-1","name":"Example","vault":"Desktop vault"}]"#
+    );
     assert!(!handle(Request::List { hostname: None }, &mut state).ok);
     desktop.locked.store(true, Ordering::SeqCst);
     assert!(
@@ -407,7 +426,15 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
         .message,
         "desktop-password"
     );
-    assert!(handle(Request::Seal, &mut state).ok);
+    assert!(
+        handle(
+            Request::Seal {
+                vault: Some(vault.clone())
+            },
+            &mut state
+        )
+        .ok
+    );
     assert!(
         !handle(
             Request::Get {
@@ -419,7 +446,15 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     );
     assert_eq!(handle(Request::Status, &mut state).message, "sealed");
     assert!(!desktop.locked.load(Ordering::SeqCst)); // CLI seal did not lock the desktop.
-    assert!(handle(Request::Resume, &mut state).ok);
+    assert!(
+        handle(
+            Request::Resume {
+                vault: Some(vault.clone())
+            },
+            &mut state
+        )
+        .ok
+    );
     desktop.revoked.store(true, Ordering::SeqCst);
     assert!(
         !handle(
@@ -442,10 +477,19 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
         )
         .ok
     );
-    assert!(!handle(Request::Resume, &mut state).ok);
+    assert!(
+        !handle(
+            Request::Resume {
+                vault: Some(vault.clone())
+            },
+            &mut state
+        )
+        .ok
+    );
     assert!(
         !handle(
             Request::Unseal {
+                vault: Some(vault.clone()),
                 password: "wrong".into()
             },
             &mut state
@@ -455,6 +499,7 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert!(
         handle(
             Request::Unseal {
+                vault: Some(vault.clone()),
                 password: "correct".into()
             },
             &mut state
@@ -471,7 +516,9 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
         .message,
         "local-password"
     );
+    assert!(vault_crypto::is_locked());
     assert!(handle(Request::List { hostname: None }, &mut state).ok);
+    assert!(vault_crypto::is_locked());
     // Explicit manual access is independent of the desktop's lock state.
     desktop.locked.store(true, Ordering::SeqCst);
     assert_eq!(
@@ -484,7 +531,12 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
         .message,
         "local-password"
     );
-    handle(Request::Seal, &mut state);
+    handle(
+        Request::Seal {
+            vault: Some(vault.clone()),
+        },
+        &mut state,
+    );
     assert!(
         !handle(
             Request::Get {
@@ -646,4 +698,71 @@ fn daemon_socket_restart_preserves_live_daemons_and_unrelated_files() {
     fs::write(&socket, "unrelated file").unwrap();
     assert!(bind_daemon(&socket).is_err());
     assert_eq!(fs::read_to_string(&socket).unwrap(), "unrelated file");
+}
+
+#[test]
+fn desktop_vault_switch_cannot_serve_a_secret_for_the_previous_vault() {
+    let desktop = Desktop::new(true);
+    desktop.pair();
+    let original = desktop.root.path().join("vaults/vault.vlt");
+    let mut state = State::new(Some((desktop.socket.clone(), desktop.identity())));
+    desktop.switch_on_fetch.store(true, Ordering::SeqCst);
+    let response = handle(
+        Request::Get {
+            id: "entry-1".into(),
+        },
+        &mut state,
+    );
+    assert!(!response.ok);
+    assert!(!response.message.contains("desktop-password"));
+    assert!(matches!(response.next, Some(NextAction::OpenPairedVault)));
+    // A per-vault seal does not disable a different desktop vault.
+    assert!(
+        handle(
+            Request::Seal {
+                vault: Some(original.clone())
+            },
+            &mut state
+        )
+        .ok
+    );
+    assert_eq!(
+        handle(
+            Request::Get {
+                id: "entry-1".into()
+            },
+            &mut state
+        )
+        .message,
+        "desktop-password"
+    );
+    fs::write(
+        desktop.root.path().join("meta.json"),
+        json!({"active-vault":"vault"}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        !handle(
+            Request::Get {
+                id: "entry-1".into()
+            },
+            &mut state
+        )
+        .ok
+    );
+    // Explicitly asking to resume a different vault must never authorize the active one.
+    fs::write(
+        desktop.root.path().join("meta.json"),
+        json!({"active-vault":"other"}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        !handle(
+            Request::Resume {
+                vault: Some(original)
+            },
+            &mut state
+        )
+        .ok
+    );
 }

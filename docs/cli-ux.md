@@ -39,13 +39,14 @@ socket and connection options in suggested follow-up commands.
 - `status` inspects and explains the current state. It does not prompt or change it.
 - `pair` guides only the actions needed to pair or validate an existing pairing. It does
   not require a CLI daemon. Never silently replace pairing credentials.
-- `unseal` checks daemon availability before asking for a password. Use desktop access
-  when possible; keep explicit manual fallback.
-- `get` and `list` explain a blocked prerequisite before attempting later steps. Do not
-  prompt for passwords as a surprise side effect. Keep passwords and JSON on stdout;
-  guidance goes to stderr.
-- `seal` describes its effect on CLI access, without implying that it locked desktop
-  Bramble or another device.
+- `unseal [VAULT]` checks daemon availability and the selected file before asking for a
+  password. Use desktop access when possible; keep explicit manual fallback.
+- `get` and `list` query all unsealed vaults without selecting one. Explain a blocked
+  prerequisite before attempting later steps. Do not prompt for passwords as a surprise
+  side effect. Keep passwords and JSON on stdout; guidance goes to stderr. Reject a
+  bare duplicate entry ID; list supplies source-qualified IDs for that case.
+- `seal [VAULT]` affects only the selected vault's CLI access, including its desktop
+  route. It does not lock another vault, desktop Bramble or another device.
 - Prompt only on a terminal; closed input cancels. An empty response never approves
   a pairing or a state-changing setup action.
 - Use ✅ for completed user actions/results, ⏳ for an action needed now and 🔒 for a
@@ -54,10 +55,10 @@ socket and connection options in suggested follow-up commands.
 
 ## Daemon setup
 
-Both setup routes are available. `service install [VAULT] --desktop` explicitly installs,
-enables and starts a systemd user service on Linux. `daemon [VAULT] --desktop` runs in the
-foreground. A single desktop vault is discovered automatically; otherwise the caller supplies
-or selects a path. `service start` and `service stop` control the installed service.
+Both setup routes are available. `service install --desktop` explicitly installs,
+enables and starts a systemd user service on Linux. `daemon --desktop` runs in the
+foreground. Neither accepts or selects a vault. `service start` and `service stop`
+control the installed service.
 
 `get`, `list` and `unseal` may offer those routes on a TTY when their daemon is missing.
 Installation requires the explicit `i` choice; empty input never selects it. After setup,
@@ -69,3 +70,24 @@ and the exact next command, retaining the invoking binary and selected socket. E
 foreign service units are preserved. Reinstalling an owned service updates its copied binary
 and restarts it, discarding any manual key. Foreground restarts safely recover an owned stale
 socket; a live daemon or an unrelated file occupying that path is preserved.
+
+## Multiple vaults
+
+The daemon can hold several independent local vault keys. Queries read all currently
+unsealed sources and do not request a vault argument, even when several are open.
+Changes can infer a target when exactly one vault is unsealed. Otherwise the caller
+selects a name, ID or path; a terminal offers numbered, named choices rather than making
+the user type a UUID/path. Noninteractive ambiguous changes fail with the available
+choices. With no unsealed vault, unseal discovers local candidates and auto-selects a
+sole candidate. Seal with no target and no open vault is a no-op.
+
+Failed unseal leaves other keys intact. Seal removes only the target key and blocks only
+that target's desktop route. Per-request local key loading always clears the crypto
+core's working slot afterward. The desktop exposes one active vault; its adjacent local
+metadata identifies that source, and a mismatch or an in-flight switch rejects a scoped
+request rather than returning another vault's credential. Closed/unavailable desktop
+access does not invalidate manually unsealed vaults.
+
+Restart discards every cached key and per-vault desktop block. Old client/daemon protocol
+combinations fail before an old global mutation can be used. Existing service units are
+updated only by explicit reinstallation, which removes the former vault argument.

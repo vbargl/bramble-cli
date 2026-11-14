@@ -3,7 +3,6 @@
 use crate::{desktop, service};
 use std::{
     ffi::OsStr,
-    fs,
     io::{self, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
@@ -52,70 +51,53 @@ pub fn read_answer(prompt: &str) -> Result<String, String> {
     Ok(answer.to_owned())
 }
 
-pub fn vault(path: Option<PathBuf>, interactive: bool) -> Result<PathBuf, String> {
-    if let Some(path) = path {
-        return fs::canonicalize(&path).map_err(|_| {
-            format!(
-                "Vault file was not found: {}. Choose an existing .vlt file.",
-                path.display()
-            )
-        });
+pub fn choose_vault(
+    choices: &[crate::vaults::Choice],
+    interactive: bool,
+) -> Result<PathBuf, String> {
+    if let [choice] = choices {
+        return Ok(choice.path.clone());
     }
-    let (socket, _) = (desktop::Options {
-        desktop_socket: None,
-        pairing_file: None,
-    })
-    .paths()?;
-    let directory = socket
-        .parent()
-        .ok_or("Cannot locate desktop vaults")?
-        .join("vaults");
-    let mut choices = Vec::new();
-    match fs::read_dir(&directory) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension() == Some(OsStr::new("vlt")) && path.is_file() {
-                    choices.push(path);
-                }
-            }
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-        Err(_) => {
-            return Err(format!(
-                "Cannot read vault directory: {}. Supply the vault path explicitly.",
-                directory.display()
-            ))
-        }
-    }
-    choices.sort();
-    if choices.len() == 1 {
-        return Ok(choices.remove(0));
+    if choices.is_empty() {
+        return Err("No vault was found. Open or restore a vault in desktop Bramble, or supply its .vlt path to unseal.".into());
     }
     if !interactive {
-        return Err("Choose a vault file by supplying its path: daemon /path/to/vault.vlt or service install /path/to/vault.vlt.".into());
+        return Err(format!(
+            "Choose the vault to change by supplying its name, ID or path.\n{}",
+            choices
+                .iter()
+                .map(|v| format!("  {} ({})", v.name, v.path.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
     }
-    if !choices.is_empty() {
-        eprintln!("Choose the vault:");
-        for (i, path) in choices.iter().enumerate() {
-            eprintln!("  {}  {}", i + 1, path.display());
+    eprintln!("Choose the vault:");
+    for (i, vault) in choices.iter().enumerate() {
+        if choices
+            .iter()
+            .filter(|other| other.name == vault.name)
+            .count()
+            > 1
+        {
+            eprintln!(
+                "  {}  {} ({}; {})",
+                i + 1,
+                vault.name,
+                vault.access,
+                vault.path.display()
+            );
+        } else {
+            eprintln!("  {}  {} ({})", i + 1, vault.name, vault.access);
         }
     }
     loop {
-        let value = read_answer("⏳ Vault path or number (q to cancel): ")?;
-        if let Ok(number) = value.parse::<usize>() {
-            if let Some(path) = number.checked_sub(1).and_then(|i| choices.get(i)) {
-                return Ok(path.clone());
+        let value = read_answer("⏳ Vault number (q to cancel): ")?;
+        if let Ok(index) = value.parse::<usize>() {
+            if let Some(vault) = index.checked_sub(1).and_then(|i| choices.get(i)) {
+                return Ok(vault.path.clone());
             }
         }
-        if !value.is_empty() {
-            if let Ok(path) = fs::canonicalize(&value) {
-                if path.is_file() {
-                    return Ok(path);
-                }
-            }
-        }
-        eprintln!("Choose an existing .vlt file.");
+        eprintln!("Choose one of the listed numbers.");
     }
 }
 
@@ -184,13 +166,12 @@ pub fn connect(socket: &Path, managed: bool, interactive: bool) -> Result<UnixSt
         };
         match choice.as_str() {
             "i" if state == service::State::Missing => {
-                let vault = vault(None, true)?;
                 let desktop = (desktop::Options {
                     desktop_socket: None,
                     pairing_file: None,
                 })
                 .paths()?;
-                service::install(socket, &vault, Some(&desktop))?;
+                service::install(socket, Some(&desktop))?;
                 eprintln!("✅ Daemon service installed and started");
             }
             "s" if matches!(state, service::State::Stopped | service::State::Failed) => {

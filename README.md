@@ -1,123 +1,183 @@
 # bramble-cli
 
-Read Bramble passwords through a single-user local daemon. Use the unlocked desktop app as a paired credential source, or manually unseal the local vault when the desktop is unavailable. CLI `seal` disables both sources in this daemon; it does not lock the desktop app or other devices.
+A single-user daemon that reads Bramble passwords. Start it independently of any vault,
+then use the unlocked desktop app or manually unseal one or more vault files. Queries
+search every unsealed vault. `seal` changes access to one vault in this daemon; it does
+not lock desktop Bramble or other devices.
 
 ## Build
 
-Rust and Cargo are required. On Nix, `nix-shell nix/shell.nix --run 'just build'` supplies the toolchain. Otherwise run `just build` with Rust, Cargo and [just](https://just.systems/) installed. The binary is `cli/target/release/bramble-cli`. Cargo fetches the Bramble crypto core from the exact revision recorded in `cli/Cargo.lock`; an initial build needs network access. `just test` runs protocol, access-state and synthetic-vault tests; `just check` checks formatting and compilation.
+Rust and Cargo are required. On Nix, `nix-shell nix/shell.nix --run 'just build'` supplies
+the toolchain. Otherwise run `just build` with Rust, Cargo and [just](https://just.systems/)
+installed. The binary is `cli/target/release/bramble-cli`. Cargo fetches the Bramble crypto
+core at the exact revision recorded in `cli/Cargo.lock`; the first build needs network
+access. `just test` runs protocol, lifecycle and synthetic-vault tests; `just check` checks
+formatting and compilation.
 
-## Start here
-
-Run `bramble-cli status`. It reports the daemon's state and the next action without
-installing or starting anything. A missing socket alone is not treated as proof that a
-service is absent: the CLI also checks the systemd user service. A foreground daemon can
-work without a service, and explicit custom sockets are diagnosed independently.
-
-Choose either way to run the daemon:
+## Start the daemon
 
 ```sh
-# Install, start and enable a Linux systemd user service:
-bramble-cli service install --desktop
-
-# Or keep the daemon running in this terminal:
+bramble-cli service install --desktop   # Linux systemd user service
+# Or, in a terminal:
 bramble-cli daemon --desktop
 ```
 
-Both commands select the only local desktop vault automatically. If there are several
-(or none), supply the existing `.vlt` path or choose it when prompted on a terminal.
-`service start` and `service stop` control an installed service. Installation copies the
-executable to `$XDG_DATA_HOME/bramble-cli/bin/bramble-cli` (fallback
-`~/.local/share/bramble-cli/bin/bramble-cli`) and writes
-`$XDG_CONFIG_HOME/systemd/user/bramble-cli.service` (fallback
-`~/.config/systemd/user/bramble-cli.service`). It never replaces a service maintained by
-another tool. Reinstalling an owned service updates its binary and restarts it, discarding
-any manually unsealed key. Installation needs a working Linux systemd user manager; the
-foreground command remains available on Unix systems.
+Neither command accepts, selects, opens or needs a vault file. Omit `--desktop` for a
+purely manual daemon. `service start` and `service stop` control the installed service.
+`status` inspects the daemon and unsealed vaults without changing anything.
 
-When `get`, `list` or `unseal` needs a missing daemon in an interactive terminal, it offers
-both setup routes and continues the original operation afterward. Installing requires an
-explicit `i` choice. `status` and `seal` only report unavailable-daemon states. Non-TTY
-input or `--no-input` disables prompts and shows a concrete follow-up command instead.
-`unseal --manual` checks daemon availability before asking for the vault password. `get`
-never starts a password prompt; if access is blocked, it shows the required action and
-lets you retry after completing it in another terminal. Passwords and list JSON stay on
-stdout; guidance goes to stderr.
+A missing socket alone does not prove that a service is uninstalled: the CLI also checks
+the systemd user service. A foreground daemon works without a service. An explicit custom
+socket is diagnosed independently. On a terminal, `get`, `list` and `unseal` offer service
+installation or manual startup when needed, then resume the requested operation.
+Installation requires the explicit `i` choice. `status` and `seal` never enter setup.
+Non-TTY input or `--no-input` disables prompts and reports the next action instead.
 
-## Pair with desktop
+## Pair desktop access
 
-Run pairing first, even if desktop Bramble is not yet open:
+Run `bramble-cli pair` first, even if desktop Bramble is not yet open. The guide shows
+only user actions: ✅ completed, ⏳ do now, 🔒 next. It tells you to unlock your desktop
+vault and open Settings → Browser extension → Connect. Finish that dialog, then press
+Enter in the CLI to retry; type `q` to cancel. Compare all twelve digits and approve in
+both places only if they match. An empty confirmation or closed input cancels.
 
-```sh
-bramble-cli pair
-```
+Pairing uses the desktop's authenticated Noise protocol. It neither copies a vault nor
+joins its sync group. The connection appears as **Bramble CLI** in the desktop's browser
+connection list; disconnect it there to revoke desktop access. Existing pairing files
+are verified, never silently replaced. Non-TTY input and `--no-input` can verify an
+existing pairing but cannot approve a new one.
 
-The guide shows only user actions: ✅ completed, ⏳ do now, and 🔒 next. If desktop Bramble is not ready, it asks you to unlock the vault and open Settings → Browser extension → Connect. Complete that dialog, then press Enter in the CLI to retry; type `q` to cancel. Routine connection checks and technical errors are omitted from the guide.
+With `--desktop`, the daemon can read the app's currently active, unlocked and paired
+vault without another password prompt. Other manually unsealed vaults remain accessible
+at the same time. Native desktop Bramble exposes one active vault at a time; this CLI
+supports multiple local vault keys independently. Desktop mode checks its adjacent
+`meta.json` to identify that active vault and refuses a scoped request if it differs or
+changes during the request. Missing or invalid metadata does not cause another vault to
+be substituted. The CLI does not modify desktop metadata or vault files.
 
-Compare all twelve digits displayed by the CLI with the desktop's digits. Confirm in both places only if they match. Pairing authenticates the desktop and this CLI with Bramble's Noise protocol. It does not copy a vault or join its sync group. If credentials already exist, `pair` verifies them without replacing them. A locked desktop prompts you to unlock and retry; a revoked pairing reports the recovery steps. Closed input or an empty digit-confirmation response cancels pairing. Non-TTY callers and `--no-input` can verify an existing pairing, but cannot initiate a new pairing that requires confirmation.
-
-The CLI appears as **Bramble CLI** in the desktop's browser connection list; disconnect it there to revoke desktop access.
-
-Start the daemon with the paired desktop enabled and the **same vault's** file as the manual fallback:
-
-```sh
-bramble-cli daemon /path/to/vaults/VAULT_ID.vlt --desktop
-```
-
-In another terminal:
+## Unseal and seal vaults
 
 ```sh
+bramble-cli unseal                       # Infer or select a vault
+bramble-cli unseal Work --manual         # Explicit name, ID or .vlt path
+bramble-cli seal Work
 bramble-cli status
+```
+
+Changes may infer the target when exactly one vault is unsealed. With several unsealed
+vaults, specify a name, ID or path, or choose a vault by number on a terminal. A script
+must identify an ambiguous target explicitly. Queries never ask for a vault.
+
+When no vault is unsealed, `unseal` discovers desktop vault files and their names. It
+uses the sole candidate automatically or offers a numbered choice. External files can
+be opened by supplying their `.vlt` path; the daemon remembers them only for this run.
+To open an additional vault when one is already unsealed, name that additional vault.
+`seal` with no unsealed vault is a no-op; an explicit target can still disable future
+desktop access to that vault.
+
+`unseal` first tries the selected vault through the paired desktop. If unavailable, it
+asks for that local vault's master password. `unseal --manual` uses the local file,
+including when a full list is needed. The CLI checks the daemon and selected file before
+asking for a password. `get` never starts a password prompt.
+
+Each manual vault key stays only in daemon memory, independently of other keys, until
+that vault is sealed or the daemon exits. Wrong-password attempts do not replace or
+clear another key. The upstream crypto core has one working key slot; each local read
+loads only its vault's cached key and clears that slot on success or error. The daemon
+serves these operations serially and rereads the file per request. If a key changes
+externally, seal and unseal that vault again.
+
+`seal VAULT` discards only that vault's manual key and disables its desktop route. Other
+vaults remain accessible. It never sends a lock command to desktop Bramble. Successful
+unseal re-enables the selected route. Manual access continues even when the desktop
+locks or exits. A daemon restart discards all manual keys and per-vault desktop blocks;
+`--desktop` again follows the unlocked desktop's active vault automatically.
+
+## Query all unsealed vaults
+
+```sh
+bramble-cli list
 bramble-cli list --hostname example.com
 bramble-cli get ENTRY_ID
-bramble-cli seal
-bramble-cli unseal
 ```
 
-While the desktop is unlocked, credential requests need no additional password. Each request opens an authenticated connection and checks the desktop's current lock and pairing state. Locking or closing the desktop stops subsequent requests; unlocking or reopening restores access, unless you explicitly sealed the daemon. Desktop mode does not retain the vault encryption key or cache credentials. No TCP port or firewall opening is needed.
+`list` merges metadata across all unsealed vaults into a JSON array with `id`, `name` and
+`vault` fields. `get` searches those vaults for an exact entry ID and prints only its
+password to stdout. Neither command requires a vault argument or selection. Guidance
+and prompts go to stderr so passwords and JSON remain usable in pipes.
 
-The desktop protocol supports exact hostname lookup of login entries, not full vault enumeration. Use `list --hostname HOST` in desktop mode. The CLI returns IDs and names as a JSON array. `get` selects by exact ID and prints the password to standard output. Protect terminal output and any receiving pipes or files.
+A desktop-backed source supports exact hostname lookup of logins, not full enumeration.
+If one is in use, `list` needs `--hostname HOST`, or that vault must be manually unsealed
+for a full list. Local hostname queries use login `urls` and exact hostname matching,
+excluding archived entries and mobile-app URI schemes. A manual key for the same vault
+takes precedence over its desktop route, avoiding duplicate results.
 
-## Manual unseal and seal
+If independent vaults contain the same entry ID (for example, after copying a vault),
+`list` qualifies those IDs as `/absolute/vault.vlt::ENTRY_ID`. Pass the complete returned
+ID to `get`. A bare ambiguous ID is rejected instead of selecting a vault silently.
+Protect terminal output and any pipes or files receiving passwords.
 
-Without `--desktop`, the daemon starts sealed and behaves as a local-vault reader:
+## Services and paths
 
-```sh
-bramble-cli daemon /path/to/vaults/VAULT_ID.vlt
-```
+Service installation copies the executable to `$XDG_DATA_HOME/bramble-cli/bin/bramble-cli`
+(fallback `~/.local/share/bramble-cli/bin/bramble-cli`) and writes
+`$XDG_CONFIG_HOME/systemd/user/bramble-cli.service` (fallback
+`~/.config/systemd/user/bramble-cli.service`). The service stores connection options only,
+never a vault selection. Reinstallation updates an owned service and restarts it,
+discarding all manual keys. Foreign service units are preserved. Installation requires
+Linux and a working systemd user manager; foreground operation works on Unix.
 
-`unseal` first tries to resume paired desktop access when configured. If that fails (desktop closed, locked, unpaired or unreachable), it prompts for the master password on the terminal and unwraps the local vault key. `unseal --manual` goes straight to that prompt, including when you need a full `list`:
+The CLI socket defaults to `$XDG_RUNTIME_DIR/bramble-cli/socket`. Global `--socket PATH`
+or `BRAMBLE_SOCKET` selects another endpoint; all clients must use the same one. Its
+parent must be private and owned by this user; the socket is mode 0600. Startup recovers
+an owned stale socket under an exclusive lock, preserving live daemons and unrelated
+files. Windows is not supported.
 
-```sh
-bramble-cli unseal --manual
-bramble-cli list
-bramble-cli get ENTRY_ID
-bramble-cli seal
-```
+Desktop pairing defaults to `$XDG_DATA_HOME/bramble-cli/desktop.json` (fallback
+`~/.local/share/bramble-cli/desktop.json`). This mode-0600 file in a private directory
+contains this client's **private pairing key** and the pinned desktop public key. It is
+not in the OS credential store. Protect it like a credential; unsafe permissions,
+ownership and symlinks are rejected. Pairing never overwrites it.
 
-Manual access is independent: it continues until CLI `seal` or daemon exit, even if the desktop locks or exits. The daemon holds the manually unwrapped key in process memory and rereads the vault file for each request. It does not modify the vault. If its encryption key changes externally, restart and unseal again. Hostname lookup is available only through desktop access; omit `--hostname` while manually unsealed.
+The desktop socket defaults to `$XDG_DATA_HOME/app.bramble.desktop/bramble.sock`
+(fallback `~/.local/share/app.bramble.desktop/bramble.sock`) on Linux, or
+`~/Library/Application Support/app.bramble.desktop/bramble.sock` on macOS. `pair`,
+`daemon` and `service install` accept `--desktop-socket PATH` and `--pairing-file PATH`;
+use matching options. Vault discovery uses that desktop directory when enabled,
+otherwise the standard desktop data directory.
 
-`seal` discards any manual key and disables desktop access in this daemon until `unseal`. It never sends a lock or unlock command to desktop Bramble. A restart discards the manual key. Starting again with `--desktop` enables desktop access automatically if the paired desktop is unlocked; an explicit seal is not persisted across daemon restarts. Starting without that flag always starts sealed.
+To deliberately re-pair, disconnect **Bramble CLI** in desktop Bramble, move only this
+CLI's pairing file aside, then run `pair`. Do not remove desktop Bramble's own pairing
+files or OS credential-store identity.
 
-## Local paths
-
-The daemon socket defaults to `$XDG_RUNTIME_DIR/bramble-cli/socket`; global `--socket PATH` or `BRAMBLE_SOCKET` selects another path. All daemon clients must use the same path. The socket's parent must be a directory owned by the current user with no group or other access. The socket is mode 0600. If a daemon terminates, its socket file may remain. Startup recovers an owned stale socket under an exclusive lock; it preserves live daemons and unrelated files at the requested path.
-
-Desktop pairing defaults to `$XDG_DATA_HOME/bramble-cli/desktop.json` (fallback `~/.local/share/bramble-cli/desktop.json`). It contains this client's **private pairing key** and the pinned desktop public key. It is stored as a mode-0600 file in a private, owned directory; it is not stored in the OS credential store. Protect it like a credential. Existing files are never overwritten by `pair`, and files with unsafe ownership/permissions or symlinks are rejected on load.
-
-The desktop socket defaults to `$XDG_DATA_HOME/app.bramble.desktop/bramble.sock` (fallback `~/.local/share/app.bramble.desktop/bramble.sock`) on Linux, or `~/Library/Application Support/app.bramble.desktop/bramble.sock` on macOS. Both `pair` and `daemon` accept `--desktop-socket PATH` and `--pairing-file PATH`; use matching overrides. Pairing works without a running CLI daemon. Windows is not supported by this Unix CLI.
-
-To re-pair, disconnect **Bramble CLI** in desktop Bramble, remove only this CLI's `desktop.json`, then run `pair` again. Do not remove desktop Bramble's own pairing files or credential-store identity.
+An older daemon must be restarted with this build (or updated using `service install`
+with your connection options). The multi-vault protocol versions responses and uses
+new mutation opcodes, so a new client cannot trigger an old daemon's global `seal`.
 
 ## Security and limitations
 
-The local user account is the access boundary: any process running as that user can ask this daemon for passwords while access is enabled. Root and processes able to inspect its memory can also access secrets. There is no network listener or extra authentication on the CLI daemon socket. Its persistent pairing key grants access while the paired desktop vault is unlocked; deleting the desktop connection revokes that route, but does not revoke a separately manually unsealed local vault key. Protect the account, pairing file and runtime directory.
+The local user account is the access boundary. Any process running as this user can ask
+the daemon for passwords while access is enabled; root or a process inspecting daemon
+memory can also access secrets. There is no network listener or extra authentication on
+the CLI socket. No TCP port or firewall change is needed. Revoking desktop pairing does
+not revoke separately cached manual keys; seal those vaults as needed.
 
-Passwords and entries pass through process memory. Best-effort memory wiping cannot guarantee removal of all copies, swap, crash dumps or terminal output. Manual mode supports only VLT1 version 2 vaults with a master-password slot and entries with a string `password`. Desktop access uses Bramble's login/autofill index and requires desktop protocol v1 with emoji/digit pairing and `linkComplete`, as implemented at the pinned upstream revision. This is an upstream internal protocol, not a stable public API. Unit tests use an independent protocol peer with upstream crypto; live desktop pairing still requires confirmation in the actual app.
+Manual mode supports VLT1 version 2 vaults with a master-password slot and entries with
+a string `password`. Passwords and keys pass through process memory; best-effort wiping
+cannot guarantee removal of every copy, swap, crash dump or terminal output. Pairing
+keys persist in the private file; manual vault encryption keys never do.
 
-WebAuthn and recovery-slot unlock, attachments, edits, vault sync, automatic manual unlock, timeout and threshold sharing are not implemented. The desktop decides its own lock timeout. Desktop pairing belongs to the vault selected when pairing; switching to an unpaired vault denies access. Keep the fallback vault path aligned with that pairing.
+Desktop access uses Bramble's login/autofill index and internal protocol v1 at the pinned
+upstream revision. It is not a stable public API. Tests use synthetic vaults and an
+independent protocol peer with upstream crypto; real desktop pairing still needs human
+confirmation. Attachments, edits, vault sync, recovery/WebAuthn-slot unlock, automatic
+manual unlock, timeout and threshold sharing are not implemented. The desktop decides
+its own lock timeout.
 
 ## License and upstream
 
-GPL-3.0-only; see [LICENSE](LICENSE). The linked [Bramble crypto core](https://github.com/bramble-sh/bramble/tree/7acadf3ef39202b75879b492a771847261341940/packages/core-rust) is GPL-3.0-only and is pinned to revision `7acadf3ef39202b75879b492a771847261341940`. Source for this program and the linked core must accompany distribution as required by the GPL.
+GPL-3.0-only; see [LICENSE](LICENSE). The linked [Bramble crypto core](https://github.com/bramble-sh/bramble/tree/7acadf3ef39202b75879b492a771847261341940/packages/core-rust)
+is GPL-3.0-only, pinned to `7acadf3ef39202b75879b492a771847261341940`. Source for this program
+and the linked core must accompany distribution as required by the GPL.
 
-The command behavior and recovery states are documented in [the CLI interaction contract](docs/cli-ux.md).
+See [the CLI interaction contract](docs/cli-ux.md) for command and recovery behavior.

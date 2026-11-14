@@ -2,6 +2,8 @@ mod desktop;
 mod guidance;
 mod pairing_ui;
 mod service;
+mod vaults;
+use vaults::State;
 
 use base64::{engine::general_purpose::STANDARD as b64, Engine};
 use clap::{Parser, Subcommand};
@@ -34,7 +36,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Run the daemon in this terminal (selects the only local vault when omitted).
+    /// Run the vault-independent daemon in this terminal.
     Daemon(Source),
     /// Install, start or stop the user daemon service.
     Service {
@@ -48,27 +50,27 @@ enum Command {
     },
     /// Enable access through the desktop, or unlock the local vault manually.
     Unseal {
+        /// Vault name, ID or .vlt path; inferred only when unambiguous.
+        vault: Option<PathBuf>,
         /// Prompt for the vault password even when the desktop is available.
         #[arg(long)]
         manual: bool,
     },
-    /// Disable all credential access through this daemon.
-    Seal,
+    /// Seal one vault; infer the target when exactly one is unsealed.
+    Seal { vault: Option<PathBuf> },
     /// Show daemon availability and vault access without changing anything.
     Status,
-    /// List entry IDs and names (desktop mode requires --hostname).
+    /// List entries across all unsealed vaults (desktop access needs --hostname).
     List {
         /// Desktop connections support exact hostname lookup, not full vault enumeration.
         #[arg(long)]
         hostname: Option<String>,
     },
-    /// Print the password for one entry ID.
+    /// Find an entry across all unsealed vaults and print its password.
     Get { id: String },
 }
 #[derive(clap::Args)]
 struct Source {
-    /// Local .vlt file; omit when the desktop has exactly one vault.
-    vault: Option<PathBuf>,
     /// Enable the paired desktop as an additional credential source.
     #[arg(long)]
     desktop: bool,
@@ -87,12 +89,29 @@ enum ServiceCommand {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 enum Request {
-    Unseal { password: String },
-    Resume,
-    Seal,
+    #[serde(rename = "vault_unseal")]
+    Unseal {
+        vault: Option<PathBuf>,
+        password: String,
+    },
+    #[serde(rename = "vault_resume")]
+    Resume {
+        vault: Option<PathBuf>,
+    },
+    #[serde(rename = "vault_seal")]
+    Seal {
+        vault: Option<PathBuf>,
+    },
+    Vaults {
+        purpose: vaults::Purpose,
+    },
     Status,
-    List { hostname: Option<String> },
-    Get { id: String },
+    List {
+        hostname: Option<String>,
+    },
+    Get {
+        id: String,
+    },
 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,26 +123,39 @@ enum NextAction {
     ManualList,
     Hostname,
     SelectEntry,
+    SelectVault,
 }
 #[derive(Serialize, Deserialize)]
 struct Response {
+    #[serde(default)]
+    protocol: u8,
     ok: bool,
     message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next: Option<NextAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    choices: Vec<vaults::Choice>,
 }
 fn fail(message: impl ToString) -> Response {
     Response {
+        protocol: 2,
         ok: false,
         message: message.to_string(),
         next: None,
+        vault: None,
+        choices: Vec::new(),
     }
 }
 fn ok(message: impl ToString) -> Response {
     Response {
+        protocol: 2,
         ok: true,
         message: message.to_string(),
         next: None,
+        vault: None,
+        choices: Vec::new(),
     }
 }
 fn socket_path(p: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -254,7 +286,7 @@ fn get(v: &Vault, id: &str) -> Result<String, String> {
     }
     Ok(password)
 }
-fn list(v: &Vault) -> Result<String, String> {
+fn summaries(v: &Vault, hostname: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
     let mut result = Vec::new();
     for entry in entries(v)? {
         let id = entry
@@ -263,135 +295,39 @@ fn list(v: &Vault) -> Result<String, String> {
             .ok_or("invalid entry id")?;
         let mut value = decrypt(&entry)?;
         let name = value.get("name").and_then(|x| x.as_str()).unwrap_or("");
-        result.push(serde_json::json!({"id": id, "name": name}));
+        let matches = hostname.is_none_or(|host| {
+            value["type"] == "login"
+                && value["archived"] != true
+                && value["urls"].as_array().is_some_and(|urls| {
+                    urls.iter().filter_map(|url| url.as_str()).any(|raw| {
+                        let raw = if raw.contains("://") {
+                            raw.to_owned()
+                        } else {
+                            format!("https://{raw}")
+                        };
+                        url::Url::parse(&raw)
+                            .ok()
+                            .filter(|url| {
+                                !["androidapp", "android", "iosapp", "ios", "appid"]
+                                    .contains(&url.scheme())
+                            })
+                            .and_then(|url| url.host_str().map(str::to_owned))
+                            .is_some_and(|name| name.eq_ignore_ascii_case(host.trim()))
+                    })
+                })
+        });
+        if matches {
+            result.push(serde_json::json!({"id": id, "name": name}));
+        }
         if let Some(serde_json::Value::String(s)) = value.get_mut("password") {
             s.zeroize();
         }
     }
-    serde_json::to_string(&result).map_err(|e| e.to_string())
-}
-
-struct State {
-    vault: PathBuf,
-    desktop: Option<(PathBuf, PathBuf)>,
-    desktop_enabled: bool,
-}
-impl State {
-    fn desktop_request(&self, body: serde_json::Value) -> Result<serde_json::Value, String> {
-        let (socket, identity) = self
-            .desktop
-            .as_ref()
-            .ok_or("desktop connection is not enabled")?;
-        if !self.desktop_enabled {
-            return Err("daemon is sealed".into());
-        }
-        desktop::request(socket, identity, body)
-    }
-    fn desktop_status(&self) -> Result<(), String> {
-        self.desktop_request(
-            serde_json::json!({"op":"query", "hostname":"bramble-cli-status.invalid"}),
-        )
-        .map(|_| ())
-    }
+    Ok(result)
 }
 
 fn handle(req: Request, state: &mut State) -> Response {
-    let credential = matches!(req, Request::Get { .. } | Request::List { .. });
-    if credential && vault_crypto::is_locked() && !state.desktop_enabled {
-        let mut response = fail("Daemon is sealed.");
-        response.next = Some(NextAction::Unseal);
-        return response;
-    }
-    let result = match req {
-        Request::Status => {
-            if !vault_crypto::is_locked() {
-                return ok("unsealed");
-            }
-            if !state.desktop_enabled {
-                let mut response = ok("sealed");
-                response.next = Some(NextAction::Unseal);
-                return response;
-            }
-            return match state.desktop_status() {
-                Ok(()) => ok("unsealed (desktop)"),
-                Err(e) => {
-                    let mut response = access_failure(e);
-                    response.ok = true;
-                    response.message = format!("sealed: {}", response.message);
-                    response
-                }
-            };
-        }
-        Request::Seal => {
-            vault_crypto::lock();
-            state.desktop_enabled = false;
-            return ok("sealed");
-        }
-        Request::Resume => {
-            if !vault_crypto::is_locked() {
-                return ok("unsealed");
-            }
-            state.desktop_enabled = state.desktop.is_some();
-            match state.desktop_status() {
-                Ok(()) => return ok("unsealed (desktop)"),
-                Err(e) => {
-                    state.desktop_enabled = false;
-                    Err(e)
-                }
-            }
-        }
-        Request::Unseal { mut password } => {
-            if !vault_crypto::is_locked() {
-                password.zeroize();
-                return fail("already unsealed");
-            }
-            let result = read_vault(&state.vault).and_then(|v| unlock(&v, &password));
-            password.zeroize();
-            match result {
-                Ok(true) => return ok("unsealed"),
-                Ok(false) => Err("incorrect password or no password slot".into()),
-                Err(e) => Err(e),
-            }
-        }
-        Request::List { hostname } => {
-            if !vault_crypto::is_locked() {
-                if hostname.is_some() {
-                    Err("hostname lookup requires desktop access; omit --hostname to list the local vault".into())
-                } else {
-                    read_vault(&state.vault).and_then(|v| list(&v))
-                }
-            } else {
-                hostname.filter(|h| !h.trim().is_empty()).ok_or_else(|| "desktop lookup requires list --hostname HOST; full list requires manual unseal".into())
-                    .and_then(|hostname| state.desktop_request(serde_json::json!({"op":"query", "hostname":hostname})))
-                    .and_then(|answer| answer.get("matches").and_then(|m| m.as_array()).ok_or("desktop reply missing matches".into()).and_then(|matches| {
-                        let items: Vec<_> = matches.iter().map(|m| serde_json::json!({"id":m["id"], "name":m["name"]})).collect();
-                        serde_json::to_string(&items).map_err(|e| e.to_string())
-                    }))
-            }
-        }
-        Request::Get { id } => {
-            if !vault_crypto::is_locked() {
-                read_vault(&state.vault).and_then(|v| get(&v, &id))
-            } else {
-                state
-                    .desktop_request(serde_json::json!({"op":"fetch", "id":id}))
-                    .and_then(|mut answer| {
-                        let password = answer
-                            .get_mut("password")
-                            .map(serde_json::Value::take)
-                            .ok_or("desktop reply missing password")?;
-                        match password {
-                            serde_json::Value::String(s) => Ok(s),
-                            _ => Err("desktop reply missing password".into()),
-                        }
-                    })
-            }
-        }
-    };
-    match result {
-        Ok(x) => ok(x),
-        Err(e) => access_failure(e),
-    }
+    state.handle(req)
 }
 
 fn access_failure(e: String) -> Response {
@@ -399,13 +335,19 @@ fn access_failure(e: String) -> Response {
         Some(NextAction::Unseal)
     } else if e == "desktop: locked" {
         Some(NextAction::OpenDesktop)
-    } else if e == "desktop: not linked to the open vault" {
+    } else if e == "desktop: not linked to the open vault"
+        || e == "desktop: wrong vault"
+        || e == "desktop: vault changed"
+    {
         Some(NextAction::OpenPairedVault)
     } else if e == "desktop: not linked to this app" {
         Some(NextAction::Pair)
     } else if e == "desktop: not paired" {
         Some(NextAction::Pair)
-    } else if e.starts_with("connect desktop:") {
+    } else if e.starts_with("connect desktop:")
+        || e == "desktop: unavailable"
+        || e == "desktop: cannot identify vault"
+    {
         Some(NextAction::OpenDesktop)
     } else if e.starts_with("desktop lookup requires") {
         Some(NextAction::ManualList)
@@ -431,13 +373,17 @@ fn access_failure(e: String) -> Response {
         Some(NextAction::Hostname) => {
             "The local vault is manually unsealed; hostname lookup uses desktop access.".to_owned()
         }
-        Some(NextAction::SelectEntry) => "Entry was not found in this vault.".to_owned(),
+        Some(NextAction::SelectEntry) => "Entry was not found in any unsealed vault.".to_owned(),
+        Some(NextAction::SelectVault) => "Choose the vault to change.".to_owned(),
         None => e,
     };
     Response {
+        protocol: 2,
         ok: false,
         message,
         next,
+        vault: None,
+        choices: Vec::new(),
     }
 }
 
@@ -515,15 +461,10 @@ fn bind_daemon(socket: &Path) -> Result<(UnixListener, fs::File), String> {
     Ok((listener, lock))
 }
 
-fn daemon(socket: &Path, vault: &Path, desktop: Option<(PathBuf, PathBuf)>) -> Result<(), String> {
-    read_vault(vault)?;
+fn daemon(socket: &Path, desktop: Option<(PathBuf, PathBuf)>) -> Result<(), String> {
     let parent = socket.parent().ok_or("socket needs a parent directory")?;
     private_dir(parent)?;
-    let mut state = State {
-        vault: vault.to_owned(),
-        desktop_enabled: desktop.is_some(),
-        desktop,
-    };
+    let mut state = State::new(desktop);
     let (listener, _lock) = bind_daemon(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     vault_crypto::lock();
@@ -575,7 +516,7 @@ fn call(mut stream: UnixStream, mut request: Request) -> Result<Response, String
         .map_err(|_| "Cannot configure the daemon connection.".to_owned())?;
     let mut data = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     data.push(b'\n');
-    if let Request::Unseal { password } = &mut request {
+    if let Request::Unseal { password, .. } = &mut request {
         password.zeroize();
     }
     let result = stream.write_all(&data);
@@ -587,37 +528,50 @@ fn call(mut stream: UnixStream, mut request: Request) -> Result<Response, String
     BufReader::new(stream)
         .read_line(&mut line)
         .map_err(|_| "Daemon did not answer. Check its terminal, or run: journalctl --user -u bramble-cli.service -n 20 --no-pager".to_owned())?;
-    let response = serde_json::from_str(&line).map_err(|_| {
+    let response: Result<Response, String> = serde_json::from_str(&line).map_err(|_| {
         "Daemon returned an invalid response. Restart the daemon with the same CLI version."
             .to_owned()
     });
     line.zeroize();
-    response
+    let mut response = response?;
+    if response.protocol != 2 {
+        response.message.zeroize();
+        return Err("Daemon needs an update. Restart it using this build; for an installed service, rerun service install with your current options.".into());
+    }
+    Ok(response)
 }
-fn next_command(next: NextAction, socket: &Path) -> String {
+fn next_command(next: NextAction, socket: &Path, vault: Option<&Path>) -> String {
+    let target = vault.map(|p| p.to_string_lossy().into_owned());
+    let mut unseal = vec!["unseal"];
+    if let Some(target) = target.as_deref() {
+        unseal.push(target);
+    }
+    let mut manual = unseal.clone();
+    manual.push("--manual");
     match next {
-        NextAction::Unseal => format!("Run: {}", guidance::command(Some(socket), &["unseal"])),
+        NextAction::Unseal => format!("Run: {}", guidance::command(Some(socket), &unseal)),
         NextAction::Pair => format!(
             "Pair using {}, or unlock locally using {}.",
             guidance::command(None, &["pair"]),
-            guidance::command(Some(socket), &["unseal", "--manual"])
+            guidance::command(Some(socket), &manual)
         ),
         NextAction::OpenDesktop => format!(
             "Open and unlock desktop Bramble, or run: {}",
-            guidance::command(Some(socket), &["unseal", "--manual"])
+            guidance::command(Some(socket), &manual)
         ),
         NextAction::OpenPairedVault => format!(
             "Open the originally paired vault in desktop Bramble, or run: {}",
-            guidance::command(Some(socket), &["unseal", "--manual"])
+            guidance::command(Some(socket), &manual)
         ),
         NextAction::ManualList => format!(
             "Use list --hostname HOST, or run {} for a full list.",
-            guidance::command(Some(socket), &["unseal", "--manual"])
+            guidance::command(Some(socket), &manual)
         ),
         NextAction::Hostname => "Omit --hostname to list the local vault.".into(),
         NextAction::SelectEntry => {
-            "Use an entry ID from list (list --hostname HOST in desktop mode).".into()
+            "Use an ID from list (with --hostname HOST when using desktop access).".into()
         }
+        NextAction::SelectVault => "Choose a vault by name, ID or path.".into(),
     }
 }
 fn response_result(mut response: Response, socket: &Path) -> Result<(), String> {
@@ -625,18 +579,67 @@ fn response_result(mut response: Response, socket: &Path) -> Result<(), String> 
         println!("{}", response.message);
         response.message.zeroize();
         if let Some(next) = response.next {
-            eprintln!("⏳ {}", next_command(next, socket));
+            eprintln!(
+                "⏳ {}",
+                next_command(next, socket, response.vault.as_deref())
+            );
         }
         Ok(())
     } else if let Some(next) = response.next {
         Err(format!(
             "{}\n⏳ {}",
             response.message,
-            next_command(next, socket)
+            next_command(next, socket, response.vault.as_deref())
         ))
     } else {
         Err(response.message)
     }
+}
+
+fn select_target(
+    socket: &Path,
+    managed: bool,
+    interactive: bool,
+    explicit: Option<PathBuf>,
+    purpose: vaults::Purpose,
+) -> Result<Option<PathBuf>, String> {
+    if explicit.as_ref().is_some_and(|p| p.is_absolute()) {
+        return Ok(explicit);
+    }
+    let stream = guidance::connect(
+        socket,
+        managed,
+        interactive && matches!(purpose, vaults::Purpose::Unseal),
+    )?;
+    let query = if explicit.is_some() {
+        vaults::Purpose::Catalog
+    } else {
+        purpose
+    };
+    let response = call(stream, Request::Vaults { purpose: query })?;
+    if !response.ok {
+        return Err(response.message);
+    }
+    let choices = if let Some(reference) = explicit {
+        let name = reference.to_string_lossy();
+        let choices: Vec<_> = response
+            .choices
+            .into_iter()
+            .filter(|v| v.name == name || v.path.file_stem() == reference.file_stem())
+            .collect();
+        if choices.is_empty() {
+            return Err(format!(
+                "Vault was not found: {name}. Use a listed name, ID or .vlt path."
+            ));
+        }
+        choices
+    } else {
+        response.choices
+    };
+    if choices.is_empty() && matches!(purpose, vaults::Purpose::Seal) {
+        return Ok(None);
+    }
+    guidance::choose_vault(&choices, interactive).map(Some)
 }
 
 fn run() -> Result<(), String> {
@@ -659,24 +662,22 @@ fn run() -> Result<(), String> {
     let managed = socket_path(None).ok().as_ref() == Some(&socket);
     let request = match cli.command {
         Command::Daemon(source) => {
-            let vault = guidance::vault(source.vault, interactive)?;
             let desktop = if source.desktop {
                 Some(source.connection.paths()?)
             } else {
                 None
             };
-            return daemon(&socket, &vault, desktop);
+            return daemon(&socket, desktop);
         }
         Command::Service { action } => {
             match action {
                 ServiceCommand::Install(source) => {
-                    let vault = guidance::vault(source.vault, interactive)?;
                     let desktop = if source.desktop {
                         Some(source.connection.paths()?)
                     } else {
                         None
                     };
-                    service::install(&socket, &vault, desktop.as_ref())?;
+                    service::install(&socket, desktop.as_ref())?;
                     eprintln!("✅ Daemon service installed and started");
                 }
                 ServiceCommand::Start => {
@@ -698,20 +699,66 @@ fn run() -> Result<(), String> {
             );
             return Ok(());
         }
-        Command::Unseal { manual } => {
+        Command::Unseal { vault, manual } => {
+            let explicit = vault.as_deref().map(vaults::reference).transpose()?;
+            let mut target = select_target(
+                &socket,
+                managed,
+                interactive,
+                explicit,
+                vaults::Purpose::Unseal,
+            )?
+            .ok_or("Choose a vault to unseal")?;
             let stream = guidance::connect(&socket, managed, interactive)?;
             if !manual {
-                let response = call(stream, Request::Resume)?;
+                let response = call(
+                    stream,
+                    Request::Resume {
+                        vault: Some(target.clone()),
+                    },
+                )?;
                 if response.ok {
                     return response_result(response, &socket);
                 }
+                if matches!(response.next, Some(NextAction::SelectVault)) {
+                    return Err(response.message);
+                }
+                if let Some(path) = response.vault {
+                    target = path;
+                }
             } else {
-                drop(stream);
+                // Detect old daemons and already-held local keys before asking for a password.
+                let state = call(
+                    stream,
+                    Request::Vaults {
+                        purpose: vaults::Purpose::Catalog,
+                    },
+                )?;
+                if state
+                    .choices
+                    .iter()
+                    .any(|v| v.path == target && v.access == "manual")
+                {
+                    return response_result(ok("unsealed"), &socket);
+                }
+            }
+            // Validate the selected local file before asking for its password.
+            let local = read_vault(&target)?;
+            if local.slots.is_empty() {
+                return Err(
+                    "This vault has no master-password slot. Use desktop access instead.".into(),
+                );
             }
             if !interactive {
-                return Err(format!("Manual unseal needs a password entered in a terminal.\n⏳ Run in a terminal: {}", guidance::command(Some(&socket), &["unseal", "--manual"])));
+                return Err(format!("Manual unseal needs a password entered in a terminal.\n⏳ Run in a terminal: {}", guidance::command(Some(&socket), &["unseal", &target.to_string_lossy(), "--manual"])));
             }
-            eprintln!("⏳ Unlock the local vault manually (independent of desktop Bramble)");
+            eprintln!(
+                "⏳ Unlock {} manually",
+                target
+                    .file_stem()
+                    .unwrap_or(target.as_os_str())
+                    .to_string_lossy()
+            );
             let mut password = rpassword::prompt_password("Master password: ")
                 .map_err(|_| "Cannot read the password. Run unseal in a terminal.".to_owned())?;
             let stream = match guidance::connect(&socket, managed, false) {
@@ -721,9 +768,28 @@ fn run() -> Result<(), String> {
                     return Err(e);
                 }
             };
-            return response_result(call(stream, Request::Unseal { password })?, &socket);
+            return response_result(
+                call(
+                    stream,
+                    Request::Unseal {
+                        vault: Some(target),
+                        password,
+                    },
+                )?,
+                &socket,
+            );
         }
-        Command::Seal => Request::Seal,
+        Command::Seal { vault } => {
+            let explicit = vault.as_deref().map(vaults::reference).transpose()?;
+            let target = select_target(
+                &socket,
+                managed,
+                interactive,
+                explicit,
+                vaults::Purpose::Seal,
+            )?;
+            Request::Seal { vault: target }
+        }
         Command::Status => Request::Status,
         Command::List { hostname } => Request::List { hostname },
         Command::Get { id } => Request::Get { id },
@@ -743,7 +809,11 @@ fn run() -> Result<(), String> {
                 | NextAction::ManualList),
             ) = response.next
             {
-                eprintln!("{}\n⏳ {}", response.message, next_command(next, &socket));
+                eprintln!(
+                    "{}\n⏳ {}",
+                    response.message,
+                    next_command(next, &socket, response.vault.as_deref())
+                );
                 guidance::read_answer("   Enter once ready to retry · q to cancel: ")?;
                 continue;
             }

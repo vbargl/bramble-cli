@@ -11,6 +11,9 @@ use std::{
 };
 
 fn fixture(path: &Path) {
+    fixture_entries(path, &[("entry-1", "Example", "synthetic-password")]);
+}
+fn fixture_entries(path: &Path, entries: &[(&str, &str, &str)]) {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap();
     vault_crypto::generate_vek().unwrap();
@@ -23,14 +26,12 @@ fn fixture(path: &Path) {
         b"VLT1\x02".to_vec(),
     )
     .unwrap();
-    let entry = vault_crypto::encrypt_entry(
-        json!({"type":"login","name":"Example","password":"synthetic-password"}).to_string(),
-    )
-    .unwrap();
-    let mut entry = serde_json::to_value(entry).unwrap();
-    entry["id"] = json!("entry-1");
+    let entries:Vec<_>=entries.iter().map(|(id,name,password)|{
+        let entry=vault_crypto::encrypt_entry(json!({"type":"login","name":name,"password":password,"urls":["https://Example.com/login"]}).to_string()).unwrap();
+        let mut entry=serde_json::to_value(entry).unwrap(); entry["id"]=json!(id); entry
+    }).collect();
     let outer =
-        vault_crypto::encrypt_with_vek(json!({"entries":[entry],"tombstones":[]}).to_string())
+        vault_crypto::encrypt_with_vek(json!({"entries":entries,"tombstones":[]}).to_string())
             .unwrap();
     let mut data = b"VLT1\x02\x01\x01\x00\x7c".to_vec();
     for part in [
@@ -70,13 +71,13 @@ impl Drop for Running {
 fn start(socket: &Path, vault: &Path) -> Running {
     start_with_options(socket, vault, &[])
 }
-fn start_with_options(socket: &Path, vault: &Path, options: &[&std::ffi::OsStr]) -> Running {
+fn start_with_options(socket: &Path, _vault: &Path, options: &[&std::ffi::OsStr]) -> Running {
     let mut child = Running(
         Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
             .arg("--socket")
             .arg(socket)
             .arg("daemon")
-            .arg(vault)
+            .env("XDG_DATA_HOME", socket.parent().unwrap().join("data"))
             .args(options)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -114,7 +115,10 @@ fn lifecycle_with_upstream_vault() {
         "sealed"
     );
     assert_eq!(
-        request(&socket, json!({"op":"unseal","password":"wrong"}))["ok"],
+        request(
+            &socket,
+            json!({"op":"vault_unseal","vault":vault,"password":"wrong"})
+        )["ok"],
         false
     );
     assert_eq!(
@@ -122,12 +126,15 @@ fn lifecycle_with_upstream_vault() {
         false
     );
     assert_eq!(
-        request(&socket, json!({"op":"unseal","password":"correct"}))["ok"],
+        request(
+            &socket,
+            json!({"op":"vault_unseal","vault":vault,"password":"correct"})
+        )["ok"],
         true
     );
     assert_eq!(
         request(&socket, json!({"op":"list"}))["message"],
-        r#"[{"id":"entry-1","name":"Example"}]"#
+        r#"[{"id":"entry-1","name":"Example","vault":"vault"}]"#
     );
     for _ in 0..2 {
         assert_eq!(
@@ -135,13 +142,16 @@ fn lifecycle_with_upstream_vault() {
             "synthetic-password"
         );
     }
-    assert_eq!(request(&socket, json!({"op":"seal"}))["ok"], true);
+    assert_eq!(request(&socket, json!({"op":"vault_seal"}))["ok"], true);
     assert_eq!(
         request(&socket, json!({"op":"get","id":"entry-1"}))["ok"],
         false
     );
     assert_eq!(
-        request(&socket, json!({"op":"unseal","password":"correct"}))["ok"],
+        request(
+            &socket,
+            json!({"op":"vault_unseal","vault":vault,"password":"correct"})
+        )["ok"],
         true
     );
     daemon.kill().unwrap();
@@ -174,15 +184,18 @@ fn lifecycle_with_upstream_vault() {
         ],
     );
     let status = request(&socket, json!({"op":"status"}));
-    assert_eq!(status["next"], "pair");
+    assert_eq!(status["next"], "open_desktop");
     assert_eq!(status["ok"], true);
-    assert_eq!(request(&socket, json!({"op":"resume"}))["ok"], false);
+    assert_eq!(request(&socket, json!({"op":"vault_resume"}))["ok"], false);
     assert_eq!(
         request(&socket, json!({"op":"get","id":"entry-1"}))["ok"],
         false
     );
     assert_eq!(
-        request(&socket, json!({"op":"unseal","password":"correct"}))["ok"],
+        request(
+            &socket,
+            json!({"op":"vault_unseal","vault":vault,"password":"correct"})
+        )["ok"],
         true
     );
     let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
@@ -204,11 +217,11 @@ fn lifecycle_with_upstream_vault() {
         String::from_utf8(output.stdout).unwrap().trim(),
         "synthetic-password"
     );
-    assert_eq!(request(&socket, json!({"op":"seal"}))["ok"], true);
-    assert_eq!(
-        request(&socket, json!({"op":"status"}))["message"],
-        "sealed"
-    );
+    assert_eq!(request(&socket, json!({"op":"vault_seal"}))["ok"], true);
+    assert!(request(&socket, json!({"op":"status"}))["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("sealed"));
     daemon.kill().unwrap();
     daemon.wait().unwrap();
 }
@@ -279,7 +292,7 @@ case "$2" in
   restart|start)
     if test "$2" = start && test -f "$TEST_ROOT/pid"; then exit 0; fi
     if test -f "$TEST_ROOT/pid"; then kill "$(cat "$TEST_ROOT/pid")" 2>/dev/null || true; sleep 0.05; fi
-    "$XDG_DATA_HOME/bramble-cli/bin/bramble-cli" --socket "$TEST_SOCKET" daemon "$TEST_VAULT" >/dev/null 2>"$TEST_ROOT/daemon.log" &
+    "$XDG_DATA_HOME/bramble-cli/bin/bramble-cli" --socket "$TEST_SOCKET" daemon >/dev/null 2>"$TEST_ROOT/daemon.log" &
     printf '%s\n' "$!" >"$TEST_ROOT/pid"
     printf 'active\n' >"$TEST_ROOT/state" ;;
   stop)
@@ -382,7 +395,6 @@ fn service_install_copies_binary_preserves_foreign_units_and_starts_a_real_synth
     let output = fixture
         .command()
         .args(["service", "install"])
-        .arg(&fixture.vault)
         .output()
         .unwrap();
     assert!(
@@ -399,19 +411,23 @@ fn service_install_copies_binary_preserves_foreign_units_and_starts_a_real_synth
         fs::metadata(&binary).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    assert!(fs::read_to_string(&unit).unwrap().contains("Type=exec"));
+    let content = fs::read_to_string(&unit).unwrap();
+    assert!(content.contains("Type=exec"));
+    assert!(!content.contains(&fixture.vault.to_string_lossy().to_string()));
     let status = fixture.command().arg("status").output().unwrap();
     assert!(status.status.success());
     assert!(!status.stderr.windows(3).any(|w| w == b"[i]"));
     // Reinstallation updates an owned unit and restarts with a fresh sealed process.
     assert_eq!(
-        request(&fixture.socket, json!({"op":"unseal","password":"correct"}))["ok"],
+        request(
+            &fixture.socket,
+            json!({"op":"vault_unseal","vault":fixture.vault,"password":"correct"})
+        )["ok"],
         true
     );
     let output = fixture
         .command()
         .args(["service", "install"])
-        .arg(&fixture.vault)
         .output()
         .unwrap();
     assert!(
@@ -433,7 +449,6 @@ fn service_install_copies_binary_preserves_foreign_units_and_starts_a_real_synth
     let output = fixture
         .command()
         .args(["service", "install"])
-        .arg(&fixture.vault)
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -493,16 +508,15 @@ fn interactive_get_resumes_original_request_after_either_setup_route() {
             wait_for("Enter once it is running");
             Some(start(&fixture.socket, &fixture.vault))
         } else {
-            // The sole desktop vault is selected without asking for a UUID path.
-            // This fixture intentionally has no desktop vault discovery entry yet: installation
-            // asks for the fallback file, and that selection remains a user action.
-            wait_for("Vault path or number");
-            writeln!(terminal, "{}", fixture.vault.display()).unwrap();
+            // Service installation is vault-independent and must not ask for a vault.
             wait_for("Enter once ready to retry");
             None
         };
         assert_eq!(
-            request(&fixture.socket, json!({"op":"unseal","password":"correct"}))["ok"],
+            request(
+                &fixture.socket,
+                json!({"op":"vault_unseal","vault":fixture.vault,"password":"correct"})
+            )["ok"],
             true
         );
         terminal.write_all(b"\n").unwrap();
@@ -542,4 +556,294 @@ fn interactive_get_resumes_original_request_after_either_setup_route() {
             choice == b"i\n"
         );
     }
+}
+
+#[test]
+fn multiple_vaults_query_together_and_mutate_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.path().join("socket");
+    let data = dir.path().join("data/app.bramble.desktop");
+    let personal = data.join("vaults/personal.vlt");
+    let work = data.join("vaults/work.vlt");
+    // Startup must succeed before any vault exists or is selected.
+    let mut daemon = start(&socket, &personal);
+    assert_eq!(
+        request(&socket, json!({"op":"status"}))["message"],
+        "sealed"
+    );
+    fs::create_dir_all(data.join("vaults")).unwrap();
+    fs::write(data.join("meta.json"),json!({"vault.registry":{"vaults":[{"id":"personal","label":"Personal"},{"id":"work","label":"Work"}]}}).to_string()).unwrap();
+    fixture_entries(
+        &personal,
+        &[
+            ("alpha", "Alpha", "alpha-secret"),
+            ("shared", "Duplicate", "personal-shared"),
+        ],
+    );
+    fixture_entries(
+        &work,
+        &[
+            ("beta", "Beta", "beta-secret"),
+            ("shared", "Duplicate", "work-shared"),
+        ],
+    );
+    let choices = request(&socket, json!({"op":"vaults","purpose":"unseal"}));
+    assert_eq!(choices["choices"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        request(&socket, json!({"op":"vault_resume"}))["next"],
+        "select_vault"
+    );
+    assert_eq!(
+        request(
+            &socket,
+            json!({"op":"vault_unseal","vault":personal,"password":"correct"})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        request(
+            &socket,
+            json!({"op":"vault_unseal","vault":work,"password":"wrong"})
+        )["ok"],
+        false
+    );
+    assert_eq!(
+        request(&socket, json!({"op":"get","id":"alpha"}))["message"],
+        "alpha-secret"
+    );
+    assert_eq!(
+        request(
+            &socket,
+            json!({"op":"vault_unseal","vault":work,"password":"correct"})
+        )["ok"],
+        true
+    );
+    for (id, secret) in [("alpha", "alpha-secret"), ("beta", "beta-secret")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(["get", id])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{secret}\n")
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty()); // No vault selection for a query.
+    let rows: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 4);
+    assert!(rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["vault"] == "Personal"));
+    assert!(rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["vault"] == "Work"));
+    assert_eq!(
+        request(&socket, json!({"op":"get","id":"shared"}))["ok"],
+        false
+    );
+    for (path, secret) in [(&personal, "personal-shared"), (&work, "work-shared")] {
+        let id = format!("{}::shared", path.display());
+        assert!(rows.as_array().unwrap().iter().any(|v| v["id"] == id));
+        assert_eq!(
+            request(&socket, json!({"op":"get","id":id}))["message"],
+            secret
+        );
+    }
+    let filtered = request(&socket, json!({"op":"list","hostname":"example.com"}));
+    assert_eq!(
+        serde_json::from_str::<Value>(filtered["message"].as_str().unwrap())
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+        .arg("--socket")
+        .arg(&socket)
+        .args(["--no-input", "seal"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("Personal") && error.contains("Work"));
+    assert_eq!(
+        request(&socket, json!({"op":"vault_seal"}))["next"],
+        "select_vault"
+    );
+    assert_eq!(
+        request(&socket, json!({"op":"get","id":"beta"}))["message"],
+        "beta-secret"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::FromRawFd;
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+        let stdin = unsafe { fs::File::from_raw_fd(slave) };
+        let log = dir.path().join("seal.log");
+        let mut child = Running(
+            Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+                .arg("--socket")
+                .arg(&socket)
+                .arg("seal")
+                .stdin(stdin)
+                .stderr(fs::File::create(&log).unwrap())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        for _ in 0..300 {
+            if fs::read_to_string(&log).unwrap().contains("Vault number") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let prompt = fs::read_to_string(&log).unwrap();
+        assert!(
+            prompt.contains("Personal") && prompt.contains("Work"),
+            "{prompt}"
+        );
+        terminal.write_all(b"1\n").unwrap();
+        for _ in 0..300 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(child.try_wait().unwrap().is_some(), "seal did not finish");
+        assert!(child.wait().unwrap().success());
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(
+        request(&socket, json!({"op":"vault_seal","vault":"Personal"}))["ok"],
+        true
+    );
+
+    assert_eq!(
+        request(&socket, json!({"op":"get","id":"alpha"}))["ok"],
+        false
+    );
+    assert_eq!(
+        request(&socket, json!({"op":"get","id":"beta"}))["message"],
+        "beta-secret"
+    );
+    // A sole unsealed vault supplies the context even when several files exist.
+    let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("unseal")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("seal")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        request(&socket, json!({"op":"get","id":"beta"}))["ok"],
+        false
+    );
+    assert_eq!(
+        request(
+            &socket,
+            json!({"op":"vault_unseal","vault":"Personal","password":"correct"})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        request(
+            &socket,
+            json!({"op":"vault_unseal","vault":"Work","password":"correct"})
+        )["ok"],
+        true
+    );
+    fs::remove_file(&personal).unwrap();
+    assert_eq!(
+        request(&socket, json!({"op":"vault_seal","vault":personal}))["ok"],
+        true
+    );
+    assert_eq!(
+        request(&socket, json!({"op":"get","id":"beta"}))["message"],
+        "beta-secret"
+    );
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let mut daemon = start(&socket, &work);
+    assert_eq!(
+        request(&socket, json!({"op":"status"}))["message"],
+        "sealed"
+    );
+    assert_eq!(
+        request(&socket, json!({"op":"get","id":"beta"}))["ok"],
+        false
+    );
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+}
+
+#[test]
+fn newer_client_cannot_trigger_an_old_daemons_global_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.path().join("socket");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        // This is the old daemon's mutating opcode; it must never be sent by this build.
+        assert_ne!(value["op"], "seal");
+        writeln!(stream, "{{\"ok\":false,\"message\":\"invalid request\"}}").unwrap();
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("seal")
+        .arg(dir.path().join("any.vlt"))
+        .output()
+        .unwrap();
+    worker.join().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Daemon needs an update"));
 }

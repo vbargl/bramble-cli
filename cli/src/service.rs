@@ -114,7 +114,6 @@ fn quote(arg: &std::ffi::OsStr) -> Result<String, String> {
 fn unit(
     binary: &Path,
     socket: &Path,
-    vault: &Path,
     desktop: Option<&(PathBuf, PathBuf)>,
 ) -> Result<String, String> {
     let mut args = vec![
@@ -122,7 +121,6 @@ fn unit(
         std::ffi::OsStr::new("--socket"),
         socket.as_os_str(),
         std::ffi::OsStr::new("daemon"),
-        vault.as_os_str(),
     ];
     if let Some((socket, identity)) = desktop {
         args.extend([
@@ -160,11 +158,7 @@ fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
     Ok(())
 }
 
-pub fn install(
-    socket: &Path,
-    vault: &Path,
-    desktop: Option<&(PathBuf, PathBuf)>,
-) -> Result<(), String> {
+pub fn install(socket: &Path, desktop: Option<&(PathBuf, PathBuf)>) -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         return Err("User-service installation requires Linux with systemd. Start the daemon manually instead.".into());
     }
@@ -174,7 +168,6 @@ pub fn install(
             "Cannot contact the user service manager. Start the daemon manually instead.".into(),
         );
     }
-    crate::read_vault(vault)?;
     if initial != State::Active && std::os::unix::net::UnixStream::connect(socket).is_ok() {
         return Err("A foreground daemon is already running. Stop it with Ctrl-C before installing the service.".into());
     }
@@ -224,13 +217,12 @@ pub fn install(
         }
     };
     let socket = absolute(socket)?;
-    let vault = absolute(vault)?;
     let desktop = desktop
         .map(|(socket, identity)| -> Result<_, String> {
             Ok((absolute(socket)?, absolute(identity)?))
         })
         .transpose()?;
-    let unit = unit(&binary, &socket, &vault, desktop.as_ref())?;
+    let unit = unit(&binary, &socket, desktop.as_ref())?;
     write_atomic(&binary, &executable, 0o700)?;
     write_atomic(&path, unit.as_bytes(), 0o600)?;
     systemctl(&["daemon-reload"])?;
@@ -246,8 +238,7 @@ mod tests {
     fn service_arguments_survive_systemd_expansion() {
         let result = unit(
             Path::new("/tmp/build dir/cli"),
-            Path::new("/run/user/123/cli.sock"),
-            Path::new("/tmp/100% $vault/quote\".vlt"),
+            Path::new("/run/user/123/100% $socket/quote\".sock"),
             Some(&(
                 PathBuf::from("/tmp/desktop.sock"),
                 PathBuf::from("/tmp/client.json"),
@@ -255,7 +246,7 @@ mod tests {
         )
         .unwrap();
         assert!(result.contains("\"/tmp/build dir/cli\" \"--socket\""));
-        assert!(result.contains("100%% $$vault/quote\\\".vlt"));
+        assert!(result.contains("100%% $$socket/quote\\\".sock"));
         assert!(result.contains("\"--desktop\" \"--desktop-socket\""));
         assert!(result.contains("UMask=0077"));
     }
