@@ -7,7 +7,24 @@ pub fn action(label: &str, command: &str) -> String {
 }
 
 pub fn steps(actions: &[String]) -> String {
-    actions
+    let numbered = actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            if actions.len() > 1 {
+                let marker = match index {
+                    0 => "1️⃣".to_owned(),
+                    1 => "2️⃣".to_owned(),
+                    2 => "3️⃣".to_owned(),
+                    _ => format!("{}.", index + 1),
+                };
+                format!("{marker} {action}")
+            } else {
+                action.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    numbered
         .join("\n\n-- or --\n\n")
         .lines()
         .map(|line| {
@@ -86,7 +103,7 @@ mod tests {
             ],
         );
         let plain = render_error(&message, false);
-        assert_eq!(plain,"! Daemon service is not installed.\n\n  Install and start the service:\n    ./tool service install --desktop\n\n  -- or --\n\n  Run in another terminal:\n    ./tool daemon --desktop");
+        assert_eq!(plain,"! Daemon service is not installed.\n\n  1️⃣ Install and start the service:\n    ./tool service install --desktop\n\n  -- or --\n\n  2️⃣ Run in another terminal:\n    ./tool daemon --desktop");
         let colored = render_error(&message, true);
         assert_eq!(
             colored,

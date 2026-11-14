@@ -898,10 +898,10 @@ fn error_hierarchy_is_readable_in_colored_plain_and_dumb_terminals() {
         assert_eq!(lines.len(), 9, "{plain}");
         assert_eq!(lines[0], "! Daemon service is not installed.");
         assert_eq!(lines[1], "");
-        assert_eq!(lines[2], "  Install and start the service:");
+        assert_eq!(lines[2], "  1️⃣ Install and start the service:");
         assert!(lines[3].starts_with("    ") && lines[3].ends_with(" service install --desktop"));
         assert_eq!(&lines[4..7], &["", "  -- or --", ""]);
-        assert_eq!(lines[7], "  Run in another terminal:");
+        assert_eq!(lines[7], "  2️⃣ Run in another terminal:");
         assert!(lines[8].starts_with("    ") && lines[8].ends_with(" daemon --desktop"));
         assert!(!plain.contains("⏳"));
     }
