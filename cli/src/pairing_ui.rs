@@ -26,27 +26,13 @@ fn retry(
     input: &mut impl BufRead,
     out: &mut impl Write,
     action: &str,
-    detail: &str,
-    existing: bool,
+    next: Option<&str>,
 ) -> Result<()> {
-    show(
-        out,
-        &[
-            &format!("⏳ {action}"),
-            &format!("   Desktop reported: {detail}"),
-            if existing {
-                "🔒 Verify the existing pairing"
-            } else {
-                "🔒 Compare the pairing digits"
-            },
-            if existing {
-                "🔒 Finish without changing your credentials"
-            } else {
-                "🔒 Approve in desktop Bramble and save the pairing"
-            },
-            "⏳ Press Enter when ready to retry, or type q to cancel.",
-        ],
-    )?;
+    show(out, &[&format!("⏳ {action}")])?;
+    if let Some(next) = next {
+        show(out, &[&format!("🔒 {next}")])?;
+    }
+    show(out, &["   Enter when ready · q to cancel"])?;
     if answer(input)?.eq_ignore_ascii_case("q") {
         return Err("pairing cancelled".into());
     }
@@ -70,98 +56,64 @@ pub fn run(
             .parent()
             .ok_or("pairing file needs a parent directory")?,
     )?;
-    show(out, &["✅ CLI ready"])?;
     if existing {
         let key = desktop::Identity::load(identity)?;
-        show(
-            out,
-            &[
-                "✅ Existing pairing credentials found",
-                "⏳ Checking the desktop connection",
-                "🔒 Verify the pairing",
-            ],
-        )?;
         loop {
             let result = desktop::Session::connect(socket, &key).and_then(|mut session| {
                 session.request_raw(json!({"op":"query", "hostname":"bramble-cli-status.invalid"}))
             });
             match result {
                 Ok(reply) if reply["ok"] == true => {
-                    return show(out, &["✅ Desktop connected and unlocked", "✅ Existing pairing verified; ready to use"]);
+                    return show(out, &["✅ Paired; ready to use"]);
                 }
                 Ok(reply) if reply["error"] == "locked" => {
-                    show(out, &["✅ Desktop connected; existing pairing authenticated"])?;
-                    retry(input, out, "Unlock the paired vault in desktop Bramble.", "vault is locked", true)?;
+                    retry(input, out, "Unlock your vault in desktop Bramble.", None)?;
                 }
-                Ok(reply) => {
-                    return Err(format!("desktop refused the existing pairing: {}. Open the vault originally paired with this CLI. To deliberately re-pair, disconnect Bramble CLI in desktop Bramble and move {} aside before running pair again. Credentials were not changed.", reply["error"].as_str().unwrap_or("unknown refusal"), identity.display()));
+                Ok(_) => {
+                    return Err(format!("Open the vault originally paired with this CLI. To pair again, disconnect Bramble CLI in desktop Bramble, move {} aside and rerun pair.", identity.display()));
                 }
-                Err(e) => retry(input, out, "Open desktop Bramble and unlock the paired vault. If it is already open, check its pairing state and logs.", &e, true)?,
+                Err(_) => retry(
+                    input,
+                    out,
+                    "Open desktop Bramble and unlock your paired vault.",
+                    None,
+                )?,
             }
         }
     }
     loop {
-        show(
-            out,
-            &[
-                "⏳ Checking whether desktop Bramble is ready to pair",
-                "🔒 Compare the pairing digits",
-                "🔒 Approve in desktop Bramble",
-                "🔒 Save the pairing",
-            ],
-        )?;
-        let mut reached = false;
         let mut comparing = false;
-        let result =
-            desktop::pair(socket, identity, |event| {
-                match event {
-                    PairEvent::Connected => {
-                        reached = true;
-                        show(out, &["✅ Local desktop connection opened"])?;
-                    }
-                    PairEvent::Compare(digits) => {
-                        comparing = true;
-                        show(out, &[
-                        "✅ Desktop accepted the pairing request",
-                        &format!("⏳ Compare these digits with desktop Bramble: {digits}"),
-                        "🔒 Approve in desktop Bramble",
-                        "🔒 Save the pairing",
-                        "⏳ Type yes only if all twelve digits match; anything else cancels.",
-                    ])?;
-                        return Ok(answer(input)? == "yes");
-                    }
-                    PairEvent::AwaitingDesktop => show(
+        let result = desktop::pair(socket, identity, |event| {
+            match event {
+                PairEvent::Compare(digits) => {
+                    comparing = true;
+                    show(
                         out,
                         &[
-                            "✅ Pairing digits confirmed in the CLI",
-                            "⏳ Click Approve in desktop Bramble",
-                            "🔒 Save the pairing",
+                            &format!("⏳ Compare with desktop Bramble: {digits}"),
+                            "🔒 Approve in desktop Bramble",
+                            "   Type yes if all twelve digits match; anything else cancels.",
                         ],
-                    )?,
+                    )?;
+                    return Ok(answer(input)? == "yes");
                 }
-                Ok(true)
-            });
-        match result {
-            Ok(()) => {
-                return show(
+                PairEvent::AwaitingDesktop => show(
                     out,
-                    &[
-                        "✅ Desktop approved the connection",
-                        "✅ Pairing saved; ready to use",
-                    ],
-                )
+                    &["✅ Digits matched", "⏳ Click Approve in desktop Bramble"],
+                )?,
             }
-            // Do not restart pairing after a mismatch, cancellation, approval or save failure.
-            // Such failures need an explicit new invocation; in particular no key is repinned.
+            Ok(true)
+        });
+        match result {
+            Ok(()) => return show(out, &["✅ Paired; ready to use"]),
+            // A mismatch, cancelled approval or failed save needs an explicit new invocation.
             Err(e) if comparing => return Err(e),
-            Err(e) => {
-                let action = if reached {
-                    "In desktop Bramble, unlock the intended vault and open Settings → Browser extension → Connect. Enter its master password and leave that dialog open. If it is already open, reopen it; continued refusal may require checking the desktop logs."
-                } else {
-                    "Open desktop Bramble, unlock the intended vault, then choose Settings → Browser extension → Connect. Enter its master password and leave that dialog open."
-                };
-                retry(input, out, action, &e, false)?;
-            }
+            Err(_) => retry(
+                input,
+                out,
+                "In desktop Bramble: unlock vault → Settings → Browser extension → Connect.",
+                Some("Compare digits and approve"),
+            )?,
         }
     }
 }

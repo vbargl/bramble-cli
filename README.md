@@ -14,7 +14,7 @@ Run pairing first, even if desktop Bramble is not yet open:
 bramble-cli pair
 ```
 
-The interactive checklist marks completed steps with ✅, the current action with ⏳, and upcoming steps with 🔒. If desktop Bramble is unavailable or refuses pairing, it tells you to open the app, unlock the intended vault and choose Settings → Browser extension → Connect. Enter the master password there and leave the dialog open, then press Enter in the CLI to retry. Type `q` to cancel. The desktop reports a generic refusal when it cannot start pairing, so a refusal does not prove which preparation step is missing; continued refusal may require checking desktop logs.
+The guide shows only user actions: ✅ completed, ⏳ do now, and 🔒 next. If desktop Bramble is not ready, it asks you to unlock the vault and open Settings → Browser extension → Connect. Complete that dialog, then press Enter in the CLI to retry; type `q` to cancel. Routine connection checks and technical errors are omitted from the guide.
 
 Compare all twelve digits displayed by the CLI with the desktop's digits. Confirm in both places only if they match. Pairing authenticates the desktop and this CLI with Bramble's Noise protocol. It does not copy a vault or join its sync group. If credentials already exist, `pair` verifies them without replacing them. A locked desktop prompts you to unlock and retry; a revoked pairing reports the recovery steps. Closed input or an empty digit-confirmation response cancels pairing.
 

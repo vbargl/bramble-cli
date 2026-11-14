@@ -534,12 +534,12 @@ fn guide_waits_for_desktop_preparation_then_pairs() {
     )
     .unwrap();
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("✅ Local desktop connection opened"));
-    assert!(output.contains("⏳ In desktop Bramble, unlock the intended vault"));
-    assert!(output.contains("Press Enter when ready to retry"));
-    assert!(output.contains("🔒 Compare the pairing digits"));
+    assert!(output
+        .contains("⏳ In desktop Bramble: unlock vault → Settings → Browser extension → Connect."));
+    assert!(output.contains("Enter when ready"));
+    assert!(output.contains("🔒 Compare digits and approve"));
     assert!(output.contains("⏳ Click Approve in desktop Bramble"));
-    assert!(output.ends_with("✅ Pairing saved; ready to use\n"));
+    assert!(output.ends_with("✅ Paired; ready to use\n"));
     assert!(desktop.identity().exists());
 }
 
@@ -558,9 +558,11 @@ fn guide_handles_missing_desktop_and_closed_input_without_claiming_success() {
         .unwrap_err();
         assert!(error.contains("cancelled"));
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("⏳ Open desktop Bramble"));
+        assert!(output.contains("⏳ In desktop Bramble:"));
         assert!(!output.contains("✅ Local desktop connection opened"));
-        assert!(!output.contains("✅ Pairing saved"));
+        assert!(!output.contains("✅ Paired"));
+        assert_eq!(output.lines().count(), 3);
+        assert!(!output.contains("Desktop reported"));
         assert!(!root.path().join("client.json").exists());
     }
 }
@@ -586,9 +588,8 @@ fn guide_checks_existing_pairing_and_waits_for_unlock_without_replacing_credenti
     )
     .unwrap();
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("✅ Existing pairing credentials found"));
-    assert!(output.contains("⏳ Unlock the paired vault in desktop Bramble"));
-    assert!(output.contains("✅ Existing pairing verified; ready to use"));
+    assert!(output.contains("⏳ Unlock your vault in desktop Bramble"));
+    assert!(output.contains("✅ Paired; ready to use"));
     assert!(before == fs::read(desktop.identity()).unwrap());
     desktop.revoked.store(true, Ordering::SeqCst);
     let error = pairing_ui::run(
@@ -598,7 +599,10 @@ fn guide_checks_existing_pairing_and_waits_for_unlock_without_replacing_credenti
         &mut Vec::new(),
     )
     .unwrap_err();
-    assert!(error.contains("refused the existing pairing"), "{error}");
+    assert!(
+        error.contains("Open the vault originally paired"),
+        "{error}"
+    );
     assert!(before == fs::read(desktop.identity()).unwrap());
 }
 
@@ -615,7 +619,5 @@ fn guide_never_treats_enter_as_approval() {
     .unwrap_err()
     .contains("cancelled"));
     assert!(!desktop.identity().exists());
-    assert!(!String::from_utf8(output)
-        .unwrap()
-        .contains("✅ Pairing saved"));
+    assert!(!String::from_utf8(output).unwrap().contains("✅ Paired"));
 }

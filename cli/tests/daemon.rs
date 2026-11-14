@@ -209,10 +209,11 @@ fn pair_guides_preparation_without_a_daemon_or_runtime_directory() {
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
     let text = String::from_utf8(output.stderr).unwrap();
-    assert!(text.contains("✅ CLI ready"));
-    assert!(text.contains("⏳ Open desktop Bramble"));
-    assert!(text.contains("🔒 Compare the pairing digits"));
+    assert!(text.contains("⏳ In desktop Bramble:"));
+    assert!(text.contains("🔒 Compare digits and approve"));
+    assert!(!text.contains("CLI ready"));
+    assert!(!text.contains("Desktop reported"));
     assert!(text.contains("pairing cancelled"));
-    assert!(!text.contains("✅ Pairing saved"));
+    assert!(!text.contains("✅ Paired"));
     assert!(!identity.exists());
 }

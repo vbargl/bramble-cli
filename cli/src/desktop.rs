@@ -174,12 +174,7 @@ fn accepted(value: Value) -> Result<Value, String> {
 }
 
 impl Session {
-    fn start(
-        path: &Path,
-        start: noise::StartResult,
-        hello: Value,
-        connected: impl FnOnce() -> Result<(), String>,
-    ) -> Result<Self, String> {
+    fn start(path: &Path, start: noise::StartResult, hello: Value) -> Result<Self, String> {
         // Close the crypto session even if connecting or the handshake fails.
         let stream = match UnixStream::connect(path) {
             Ok(s) => s,
@@ -193,7 +188,6 @@ impl Session {
             id: start.session_id,
         };
         session.timeout(Duration::from_secs(5))?;
-        connected()?;
         write_frame(&mut session.stream, &hello)?;
         write_frame(&mut session.stream, &json!({"message": start.message}))?;
         let reply = accepted(read_frame(&mut session.stream)?)?;
@@ -226,7 +220,6 @@ impl Session {
             socket,
             start,
             json!({"kind":"hello", "v":1, "publicKey":identity.public_key}),
-            || Ok(()),
         )
     }
 
@@ -291,7 +284,6 @@ fn sas_digits(material: &[u8]) -> String {
 }
 
 pub enum PairEvent<'a> {
-    Connected,
     Compare(&'a str),
     AwaitingDesktop,
 }
@@ -323,7 +315,6 @@ pub fn pair(
         socket,
         start?,
         json!({"kind":"link", "v":1, "label":"Bramble CLI"}),
-        || progress(PairEvent::Connected).map(|_| ()),
     )?;
     let mut nonce = [0; 32];
     getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
