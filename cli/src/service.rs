@@ -74,9 +74,12 @@ fn systemctl(args: &[&str]) -> Result<(), String> {
 
 pub fn start(socket: &Path) -> Result<(), String> {
     if state() == State::Missing {
-        return Err(format!(
-            "Daemon service is not installed.\n⏳ Run: {}",
-            crate::guidance::command(Some(socket), &["service", "install", "--desktop"])
+        return Err(crate::terminal::recovery(
+            "Daemon service is not installed.",
+            &[crate::terminal::action(
+                "Install and start the service:",
+                &crate::guidance::command(Some(socket), &["service", "install", "--desktop"]),
+            )],
         ));
     }
     systemctl(&["start", UNIT])?;

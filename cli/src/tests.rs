@@ -588,10 +588,10 @@ fn guide_waits_for_desktop_preparation_then_pairs() {
     .unwrap();
     let output = String::from_utf8(output).unwrap();
     assert!(output
-        .contains("⏳ In desktop Bramble: unlock vault → Settings → Browser extension → Connect."));
+        .contains("! Desktop Bramble is not ready to pair.\n\n  In desktop Bramble: unlock vault → Settings → Browser extension → Connect."));
     assert!(output.contains("Enter when ready"));
-    assert!(output.contains("🔒 Compare digits and approve"));
-    assert!(output.contains("⏳ Click Approve in desktop Bramble"));
+    assert!(!output.contains("⏳"));
+    assert!(output.contains("\n\n  Click Approve in desktop Bramble"));
     assert!(output.ends_with("✅ Paired; ready to use\n"));
     assert!(desktop.identity().exists());
 }
@@ -612,10 +612,11 @@ fn guide_handles_missing_desktop_and_closed_input_without_claiming_success() {
         .unwrap_err();
         assert!(error.contains("cancelled"));
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("⏳ In desktop Bramble:"));
+        assert!(output.contains("! Desktop Bramble is not ready to pair.\n\n  In desktop Bramble:"));
         assert!(!output.contains("✅ Local desktop connection opened"));
         assert!(!output.contains("✅ Paired"));
-        assert_eq!(output.lines().count(), 3);
+        assert_eq!(output.lines().count(), 5);
+        assert!(!output.contains("⏳"));
         assert!(!output.contains("Desktop reported"));
         assert!(!root.path().join("client.json").exists());
     }
@@ -643,7 +644,7 @@ fn guide_checks_existing_pairing_and_waits_for_unlock_without_replacing_credenti
     )
     .unwrap();
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("⏳ Unlock your vault in desktop Bramble"));
+    assert!(output.contains("! Desktop vault is locked.\n\n  Unlock your vault in desktop Bramble"));
     assert!(output.contains("✅ Paired; ready to use"));
     assert!(before == fs::read(desktop.identity()).unwrap());
     desktop.revoked.store(true, Ordering::SeqCst);

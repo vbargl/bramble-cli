@@ -2,6 +2,7 @@ mod desktop;
 mod guidance;
 mod pairing_ui;
 mod service;
+mod terminal;
 mod vaults;
 use vaults::State;
 
@@ -473,10 +474,10 @@ fn daemon(socket: &Path, desktop: Option<(PathBuf, PathBuf)>) -> Result<(), Stri
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     vault_crypto::lock();
     eprintln!("✅ Daemon started");
-    eprintln!(
-        "⏳ In another terminal, run: {}",
-        guidance::command(Some(socket), &["status"])
-    );
+    terminal::instructions(&[terminal::action(
+        "In another terminal, check access:",
+        &guidance::command(Some(socket), &["status"]),
+    )]);
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -504,7 +505,18 @@ fn daemon(socket: &Path, desktop: Option<(PathBuf, PathBuf)>) -> Result<(), Stri
 }
 fn main() {
     if let Err(e) = run() {
-        eprintln!("{e}");
+        if matches!(
+            e.as_str(),
+            "Cancelled."
+                | "Cancelled (input closed)."
+                | "pairing cancelled"
+                | "pairing cancelled (input closed)"
+                | "pairing cancelled; desktop identity was not saved"
+        ) {
+            eprintln!("{e}");
+        } else {
+            terminal::error(&e);
+        }
         std::process::exit(1);
     }
 }
@@ -526,24 +538,51 @@ fn call(mut stream: UnixStream, mut request: Request) -> Result<Response, String
     let result = stream.write_all(&data);
     data.zeroize();
     result.map_err(|_| {
-        "Daemon connection was lost. Retry the command after checking the daemon's terminal or user-service log.".to_owned()
+        terminal::recovery(
+            "Daemon connection was lost.",
+            &[
+                "Check its terminal and retry the command.".into(),
+                terminal::action(
+                    "Check a user service's log:",
+                    "journalctl --user -u bramble-cli.service -n 20 --no-pager",
+                ),
+            ],
+        )
     })?;
     let mut line = String::new();
-    BufReader::new(stream)
-        .read_line(&mut line)
-        .map_err(|_| "Daemon did not answer. Check its terminal, or run: journalctl --user -u bramble-cli.service -n 20 --no-pager".to_owned())?;
+    BufReader::new(stream).read_line(&mut line).map_err(|_| {
+        terminal::recovery(
+            "Daemon did not answer.",
+            &[
+                "Check its foreground terminal.".into(),
+                terminal::action(
+                    "Check a user service's log:",
+                    "journalctl --user -u bramble-cli.service -n 20 --no-pager",
+                ),
+            ],
+        )
+    })?;
     let response: Result<Response, String> = serde_json::from_str(&line).map_err(|_| {
-        "Daemon returned an invalid response. Restart the daemon using this build.".to_owned()
+        terminal::recovery(
+            "Daemon returned an invalid response.",
+            &["Restart the daemon using this build.".into()],
+        )
     });
     line.zeroize();
     let mut response = response?;
     if response.protocol != 2 {
         response.message.zeroize();
-        return Err("Daemon needs an update. Restart it using this build; for an installed service, rerun service install with your current options.".into());
+        return Err(terminal::recovery(
+            "Daemon needs an update.",
+            &[
+                "For an installed service, rerun service install with the same connection options used for installation.".into(),
+                "For a foreground daemon, stop it and restart it using this build.".into(),
+            ],
+        ));
     }
     Ok(response)
 }
-fn next_command(next: NextAction, socket: &Path, vault: Option<&Path>) -> String {
+fn next_actions(next: NextAction, socket: &Path, vault: Option<&Path>) -> Vec<String> {
     let target = vault.map(|p| p.to_string_lossy().into_owned());
     let mut unseal = vec!["unseal"];
     if let Some(target) = target.as_deref() {
@@ -552,46 +591,63 @@ fn next_command(next: NextAction, socket: &Path, vault: Option<&Path>) -> String
     let mut manual = unseal.clone();
     manual.push("--manual");
     match next {
-        NextAction::Unseal => format!("Run: {}", guidance::command(Some(socket), &unseal)),
-        NextAction::Pair => format!(
-            "Pair using {}, or unlock locally using {}.",
-            guidance::command(None, &["pair"]),
-            guidance::command(Some(socket), &manual)
-        ),
-        NextAction::OpenDesktop => format!(
-            "Open and unlock desktop Bramble, or run: {}",
-            guidance::command(Some(socket), &manual)
-        ),
-        NextAction::OpenPairedVault => format!(
-            "Open the originally paired vault in desktop Bramble, or run: {}",
-            guidance::command(Some(socket), &manual)
-        ),
-        NextAction::ManualList => format!(
-            "Use list --hostname HOST, or run {} for a full list.",
-            guidance::command(Some(socket), &manual)
-        ),
+        NextAction::Unseal => vec![terminal::action(
+            "Unseal the vault:",
+            &guidance::command(Some(socket), &unseal),
+        )],
+        NextAction::Pair => vec![
+            terminal::action(
+                "Pair with desktop Bramble:",
+                &guidance::command(None, &["pair"]),
+            ),
+            terminal::action(
+                "Unlock the local vault manually:",
+                &guidance::command(Some(socket), &manual),
+            ),
+        ],
+        NextAction::OpenDesktop => vec![
+            "Open and unlock desktop Bramble.".into(),
+            terminal::action(
+                "Unlock the local vault manually:",
+                &guidance::command(Some(socket), &manual),
+            ),
+        ],
+        NextAction::OpenPairedVault => vec![
+            "Open the intended paired vault in desktop Bramble.".into(),
+            terminal::action(
+                "Unlock the local vault manually:",
+                &guidance::command(Some(socket), &manual),
+            ),
+        ],
+        NextAction::ManualList => vec![
+            terminal::action(
+                "Look up logins by hostname:",
+                &guidance::command(Some(socket), &["list", "--hostname", "HOST"]),
+            ),
+            terminal::action(
+                "Unlock the local vault for a full list:",
+                &guidance::command(Some(socket), &manual),
+            ),
+        ],
         NextAction::SelectEntry => {
-            "Use an ID from list (with --hostname HOST when using desktop access).".into()
+            vec!["Use an ID from list (with --hostname HOST when using desktop access).".into()]
         }
-        NextAction::SelectVault => "Choose a vault by name, ID or path.".into(),
+        NextAction::SelectVault => vec!["Choose a vault by name, ID or path.".into()],
     }
 }
+
 fn response_result(mut response: Response, socket: &Path) -> Result<(), String> {
     if response.ok {
         println!("{}", response.message);
         response.message.zeroize();
         if let Some(next) = response.next {
-            eprintln!(
-                "⏳ {}",
-                next_command(next, socket, response.vault.as_deref())
-            );
+            terminal::instructions(&next_actions(next, socket, response.vault.as_deref()));
         }
         Ok(())
     } else if let Some(next) = response.next {
-        Err(format!(
-            "{}\n⏳ {}",
-            response.message,
-            next_command(next, socket, response.vault.as_deref())
+        Err(terminal::recovery(
+            &response.message,
+            &next_actions(next, socket, response.vault.as_deref()),
         ))
     } else {
         Err(response.message)
@@ -695,10 +751,10 @@ fn run() -> Result<(), String> {
                     return Ok(());
                 }
             }
-            eprintln!(
-                "⏳ Check access: {}",
-                guidance::command(Some(&socket), &["status"])
-            );
+            terminal::instructions(&[terminal::action(
+                "Check access:",
+                &guidance::command(Some(&socket), &["status"]),
+            )]);
             return Ok(());
         }
         Command::Unseal { vault, manual } => {
@@ -752,10 +808,19 @@ fn run() -> Result<(), String> {
                 );
             }
             if !interactive {
-                return Err(format!("Manual unseal needs a password entered in a terminal.\n⏳ Run in a terminal: {}", guidance::command(Some(&socket), &["unseal", &target.to_string_lossy(), "--manual"])));
+                return Err(terminal::recovery(
+                    "Manual unseal needs a password entered in a terminal.",
+                    &[terminal::action(
+                        "Run in a terminal:",
+                        &guidance::command(
+                            Some(&socket),
+                            &["unseal", &target.to_string_lossy(), "--manual"],
+                        ),
+                    )],
+                ));
             }
             eprintln!(
-                "⏳ Unlock {} manually",
+                "Unlock {} manually",
                 target
                     .file_stem()
                     .unwrap_or(target.as_os_str())
@@ -811,12 +876,11 @@ fn run() -> Result<(), String> {
                 | NextAction::ManualList),
             ) = response.next
             {
-                eprintln!(
-                    "{}\n⏳ {}",
-                    response.message,
-                    next_command(next, &socket, response.vault.as_deref())
-                );
-                guidance::read_answer("   Enter once ready to retry · q to cancel: ")?;
+                terminal::error(&terminal::recovery(
+                    &response.message,
+                    &next_actions(next, &socket, response.vault.as_deref()),
+                ));
+                guidance::read_answer("\n  Enter once ready to retry · q to cancel: ")?;
                 continue;
             }
         }

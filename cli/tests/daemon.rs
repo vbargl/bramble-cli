@@ -847,3 +847,67 @@ fn newer_client_cannot_trigger_an_old_daemons_global_seal() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Daemon needs an update"));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn error_hierarchy_is_readable_in_colored_plain_and_dumb_terminals() {
+    use std::{io::Read, os::fd::FromRawFd};
+    let fixture = ServiceFixture::new();
+    for (term, no_color, colored) in [
+        ("xterm", None, true),
+        ("xterm", Some("1"), false),
+        ("dumb", None, false),
+    ] {
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+        let stderr = unsafe { fs::File::from_raw_fd(slave) };
+        let mut command = fixture.command();
+        command
+            .arg("status")
+            .env("TERM", term)
+            .env_remove("NO_COLOR")
+            .stderr(stderr);
+        if let Some(value) = no_color {
+            command.env("NO_COLOR", value);
+        }
+        let output = command.output().unwrap();
+        drop(command); // Close the parent's duplicate of the slave before reading to EOF.
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let mut bytes = Vec::new();
+        let _ = terminal.read_to_end(&mut bytes); // Linux PTYs report EIO at the final EOF.
+        let text = String::from_utf8(bytes).unwrap().replace('\r', "");
+        assert_eq!(text.contains("\x1b[1;31m"), colored, "{text:?}");
+        if !colored {
+            assert!(!text.contains('\x1b'));
+        }
+        let plain = text.replace("\x1b[1;31m", "").replace("\x1b[0m", "");
+        let lines: Vec<_> = plain.lines().collect();
+        assert_eq!(lines.len(), 9, "{plain}");
+        assert_eq!(lines[0], "! Daemon service is not installed.");
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "  Install and start the service:");
+        assert!(lines[3].starts_with("    ") && lines[3].ends_with(" service install --desktop"));
+        assert_eq!(&lines[4..7], &["", "  -- or --", ""]);
+        assert_eq!(lines[7], "  Run in another terminal:");
+        assert!(lines[8].starts_with("    ") && lines[8].ends_with(" daemon --desktop"));
+        assert!(!plain.contains("⏳"));
+    }
+    assert!(!fixture
+        .root
+        .path()
+        .join("config/systemd/user/bramble-cli.service")
+        .exists());
+}

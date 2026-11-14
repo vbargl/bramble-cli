@@ -25,21 +25,30 @@ fn answer(input: &mut impl BufRead) -> Result<String> {
 fn retry(
     input: &mut impl BufRead,
     out: &mut impl Write,
+    problem: &str,
     action: &str,
-    next: Option<&str>,
     interactive: bool,
 ) -> Result<()> {
     if !interactive {
-        return Err(format!(
-            "{action}\n⏳ Run in a terminal: {}",
-            crate::guidance::command(None, &["pair"])
+        return Err(crate::terminal::recovery(
+            problem,
+            &[
+                action.to_owned(),
+                crate::terminal::action(
+                    "Run in a terminal:",
+                    &crate::guidance::command(None, &["pair"]),
+                ),
+            ],
         ));
     }
-    show(out, &[&format!("⏳ {action}")])?;
-    if let Some(next) = next {
-        show(out, &[&format!("🔒 {next}")])?;
-    }
-    show(out, &["   Enter when ready · q to cancel"])?;
+    show(
+        out,
+        &[
+            &crate::terminal::error_text(&crate::terminal::recovery(problem, &[action.to_owned()])),
+            "",
+            "  Enter when ready · q to cancel",
+        ],
+    )?;
     if answer(input)?.eq_ignore_ascii_case("q") {
         return Err("pairing cancelled".into());
     }
@@ -78,28 +87,34 @@ pub fn run(
                     retry(
                         input,
                         out,
+                        "Desktop vault is locked.",
                         "Unlock your vault in desktop Bramble.",
-                        None,
                         interactive,
                     )?;
                 }
                 Ok(_) => {
-                    return Err(format!("Open the vault originally paired with this CLI. To pair again, disconnect Bramble CLI in desktop Bramble, move {} aside and rerun pair.", identity.display()));
+                    return Err(crate::terminal::recovery("Desktop Bramble rejected the existing pairing.",&[
+                        "Open the vault originally paired with this CLI.".into(),
+                        format!("Pair again:\n  Disconnect Bramble CLI in desktop Bramble.\n  Move {} aside.\n  Run {}.",identity.display(),crate::guidance::command(None,&["pair"])),
+                    ]));
                 }
                 Err(_) => retry(
                     input,
                     out,
+                    "Desktop Bramble is unavailable.",
                     "Open desktop Bramble and unlock your paired vault.",
-                    None,
                     interactive,
                 )?,
             }
         }
     }
     if !interactive {
-        return Err(format!(
-            "Pairing needs your confirmation.\n⏳ Run in a terminal: {}",
-            crate::guidance::command(None, &["pair"])
+        return Err(crate::terminal::recovery(
+            "Pairing needs your confirmation.",
+            &[crate::terminal::action(
+                "Run in a terminal:",
+                &crate::guidance::command(None, &["pair"]),
+            )],
         ));
     }
     loop {
@@ -111,16 +126,22 @@ pub fn run(
                     show(
                         out,
                         &[
-                            &format!("⏳ Compare with desktop Bramble: {digits}"),
-                            "🔒 Approve in desktop Bramble",
-                            "   Type yes if all twelve digits match; anything else cancels.",
+                            "Compare the pairing digits with desktop Bramble:",
+                            "",
+                            &format!("  {digits}"),
+                            "",
+                            "  Type yes if all twelve digits match; anything else cancels.",
                         ],
                     )?;
                     return Ok(answer(input)? == "yes");
                 }
                 PairEvent::AwaitingDesktop => show(
                     out,
-                    &["✅ Digits matched", "⏳ Click Approve in desktop Bramble"],
+                    &[
+                        "✅ Digits matched",
+                        "",
+                        "  Click Approve in desktop Bramble",
+                    ],
                 )?,
             }
             Ok(true)
@@ -132,8 +153,8 @@ pub fn run(
             Err(_) => retry(
                 input,
                 out,
+                "Desktop Bramble is not ready to pair.",
                 "In desktop Bramble: unlock vault → Settings → Browser extension → Connect.",
-                Some("Compare digits and approve"),
                 interactive,
             )?,
         }

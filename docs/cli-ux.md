@@ -49,9 +49,15 @@ socket and connection options in suggested follow-up commands.
   route. It does not lock another vault, desktop Bramble or another device.
 - Prompt only on a terminal; closed input cancels. An empty response never approves
   a pairing or a state-changing setup action.
-- Use ✅ for completed user actions/results, ⏳ for an action needed now and 🔒 for a
-  relevant upcoming user action. Do not print internal connection events or a growing
-  duplicate checklist. Keep diagnostics separate from normal guidance.
+- Give errors one visual anchor: `!` and red emphasis on a capable stderr terminal.
+  Then leave a blank line and indent the related recovery actions. Put copyable commands
+  on a further-indented line. Separate alternatives with a standalone `-- or --` and
+  surrounding blank lines. Keep the same reading order across commands.
+- Do not label every instruction with an hourglass. Use waiting indicators only for
+  actual waits; ordinary user actions remain plain text. Keep success/results distinct
+  from errors, and do not print routine connection events or duplicate checklists.
+- Honor `NO_COLOR`, `TERM=dumb` and stderr's own TTY state. Hierarchy must still work
+  without color, and application data on stdout is never styled.
 
 ## Daemon setup
 

@@ -33,10 +33,17 @@ installation or manual startup when needed, then resume the requested operation.
 Installation requires the explicit `i` choice. `status` and `seal` never enter setup.
 Non-TTY input or `--no-input` disables prompts and reports the next action instead.
 
+Diagnostics use an error-first layout: `!` and restrained red emphasis, a blank line,
+then indented recovery actions. Alternatives are separated by `-- or --`; commands get
+their own indented lines. Ordinary instructions do not carry hourglass icons. Color is
+disabled for redirected stderr, nonempty `NO_COLOR`, and `TERM=dumb`; the text hierarchy
+is the same without ANSI color.
+
 ## Pair desktop access
 
 Run `bramble-cli pair` first, even if desktop Bramble is not yet open. The guide shows
-only user actions: ✅ completed, ⏳ do now, 🔒 next. It tells you to unlock your desktop
+user actions, with a clear error heading and indented recovery steps when blocked.
+It tells you to unlock your desktop
 vault and open Settings → Browser extension → Connect. Finish that dialog, then press
 Enter in the CLI to retry; type `q` to cancel. Compare all twelve digits and approve in
 both places only if they match. An empty confirmation or closed input cancels.
