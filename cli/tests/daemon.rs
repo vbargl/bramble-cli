@@ -46,11 +46,15 @@ fn fixture(path: &Path) {
     vault_crypto::lock();
 }
 fn start(socket: &Path, vault: &Path) -> Child {
+    start_with_options(socket, vault, &[])
+}
+fn start_with_options(socket: &Path, vault: &Path, options: &[&std::ffi::OsStr]) -> Child {
     let child = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
         .arg("--socket")
         .arg(socket)
         .arg("daemon")
         .arg(vault)
+        .args(options)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -124,6 +128,62 @@ fn lifecycle_with_upstream_vault() {
     assert_eq!(
         request(&socket, json!({"op":"get","id":"entry-1"}))["ok"],
         false
+    );
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+
+    // Exercise the executable's desktop flags, IPC resume, and explicit manual fallback
+    // with a desktop that is not running. The local vault remains available independently.
+    fs::remove_file(&socket).unwrap();
+    let desktop_socket = dir.path().join("absent-desktop.sock");
+    let pairing_file = dir.path().join("absent-pairing.json");
+    let mut daemon = start_with_options(
+        &socket,
+        &vault,
+        &[
+            std::ffi::OsStr::new("--desktop"),
+            std::ffi::OsStr::new("--desktop-socket"),
+            desktop_socket.as_os_str(),
+            std::ffi::OsStr::new("--pairing-file"),
+            pairing_file.as_os_str(),
+        ],
+    );
+    assert!(request(&socket, json!({"op":"status"}))["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("sealed ("));
+    assert_eq!(request(&socket, json!({"op":"resume"}))["ok"], false);
+    assert_eq!(
+        request(&socket, json!({"op":"get","id":"entry-1"}))["ok"],
+        false
+    );
+    assert_eq!(
+        request(&socket, json!({"op":"unseal","password":"correct"}))["ok"],
+        true
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+        .args(["--socket"])
+        .arg(&socket)
+        .arg("unseal")
+        .output()
+        .unwrap();
+    assert!(output.status.success()); // Already manually unsealed: no terminal prompt.
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "unsealed");
+    let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+        .arg("--socket")
+        .arg(&socket)
+        .args(["get", "entry-1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        "synthetic-password"
+    );
+    assert_eq!(request(&socket, json!({"op":"seal"}))["ok"], true);
+    assert_eq!(
+        request(&socket, json!({"op":"status"}))["message"],
+        "sealed"
     );
     daemon.kill().unwrap();
     daemon.wait().unwrap();

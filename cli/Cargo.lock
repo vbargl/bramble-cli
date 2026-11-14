@@ -162,10 +162,13 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "clap",
+ "getrandom 0.2.17",
+ "hkdf",
  "libc",
  "rpassword",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "vault-crypto",
  "zeroize",
