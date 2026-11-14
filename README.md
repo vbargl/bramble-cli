@@ -6,6 +6,43 @@ Read Bramble passwords through a single-user local daemon. Use the unlocked desk
 
 Rust and Cargo are required. On Nix, `nix-shell nix/shell.nix --run 'just build'` supplies the toolchain. Otherwise run `just build` with Rust, Cargo and [just](https://just.systems/) installed. The binary is `cli/target/release/bramble-cli`. Cargo fetches the Bramble crypto core from the exact revision recorded in `cli/Cargo.lock`; an initial build needs network access. `just test` runs protocol, access-state and synthetic-vault tests; `just check` checks formatting and compilation.
 
+## Start here
+
+Run `bramble-cli status`. It reports the daemon's state and the next action without
+installing or starting anything. A missing socket alone is not treated as proof that a
+service is absent: the CLI also checks the systemd user service. A foreground daemon can
+work without a service, and explicit custom sockets are diagnosed independently.
+
+Choose either way to run the daemon:
+
+```sh
+# Install, start and enable a Linux systemd user service:
+bramble-cli service install --desktop
+
+# Or keep the daemon running in this terminal:
+bramble-cli daemon --desktop
+```
+
+Both commands select the only local desktop vault automatically. If there are several
+(or none), supply the existing `.vlt` path or choose it when prompted on a terminal.
+`service start` and `service stop` control an installed service. Installation copies the
+executable to `$XDG_DATA_HOME/bramble-cli/bin/bramble-cli` (fallback
+`~/.local/share/bramble-cli/bin/bramble-cli`) and writes
+`$XDG_CONFIG_HOME/systemd/user/bramble-cli.service` (fallback
+`~/.config/systemd/user/bramble-cli.service`). It never replaces a service maintained by
+another tool. Reinstalling an owned service updates its binary and restarts it, discarding
+any manually unsealed key. Installation needs a working Linux systemd user manager; the
+foreground command remains available on Unix systems.
+
+When `get`, `list` or `unseal` needs a missing daemon in an interactive terminal, it offers
+both setup routes and continues the original operation afterward. Installing requires an
+explicit `i` choice. `status` and `seal` only report unavailable-daemon states. Non-TTY
+input or `--no-input` disables prompts and shows a concrete follow-up command instead.
+`unseal --manual` checks daemon availability before asking for the vault password. `get`
+never starts a password prompt; if access is blocked, it shows the required action and
+lets you retry after completing it in another terminal. Passwords and list JSON stay on
+stdout; guidance goes to stderr.
+
 ## Pair with desktop
 
 Run pairing first, even if desktop Bramble is not yet open:
@@ -16,7 +53,7 @@ bramble-cli pair
 
 The guide shows only user actions: ✅ completed, ⏳ do now, and 🔒 next. If desktop Bramble is not ready, it asks you to unlock the vault and open Settings → Browser extension → Connect. Complete that dialog, then press Enter in the CLI to retry; type `q` to cancel. Routine connection checks and technical errors are omitted from the guide.
 
-Compare all twelve digits displayed by the CLI with the desktop's digits. Confirm in both places only if they match. Pairing authenticates the desktop and this CLI with Bramble's Noise protocol. It does not copy a vault or join its sync group. If credentials already exist, `pair` verifies them without replacing them. A locked desktop prompts you to unlock and retry; a revoked pairing reports the recovery steps. Closed input or an empty digit-confirmation response cancels pairing.
+Compare all twelve digits displayed by the CLI with the desktop's digits. Confirm in both places only if they match. Pairing authenticates the desktop and this CLI with Bramble's Noise protocol. It does not copy a vault or join its sync group. If credentials already exist, `pair` verifies them without replacing them. A locked desktop prompts you to unlock and retry; a revoked pairing reports the recovery steps. Closed input or an empty digit-confirmation response cancels pairing. Non-TTY callers and `--no-input` can verify an existing pairing, but cannot initiate a new pairing that requires confirmation.
 
 The CLI appears as **Bramble CLI** in the desktop's browser connection list; disconnect it there to revoke desktop access.
 
@@ -63,7 +100,7 @@ Manual access is independent: it continues until CLI `seal` or daemon exit, even
 
 ## Local paths
 
-The daemon socket defaults to `$XDG_RUNTIME_DIR/bramble-cli/socket`; global `--socket PATH` or `BRAMBLE_SOCKET` selects another path. All daemon clients must use the same path. The socket's parent must be a directory owned by the current user with no group or other access. The socket is mode 0600. If a daemon terminates, its socket file may remain; after ensuring no daemon is running, remove that file before restarting.
+The daemon socket defaults to `$XDG_RUNTIME_DIR/bramble-cli/socket`; global `--socket PATH` or `BRAMBLE_SOCKET` selects another path. All daemon clients must use the same path. The socket's parent must be a directory owned by the current user with no group or other access. The socket is mode 0600. If a daemon terminates, its socket file may remain. Startup recovers an owned stale socket under an exclusive lock; it preserves live daemons and unrelated files at the requested path.
 
 Desktop pairing defaults to `$XDG_DATA_HOME/bramble-cli/desktop.json` (fallback `~/.local/share/bramble-cli/desktop.json`). It contains this client's **private pairing key** and the pinned desktop public key. It is stored as a mode-0600 file in a private, owned directory; it is not stored in the OS credential store. Protect it like a credential. Existing files are never overwritten by `pair`, and files with unsafe ownership/permissions or symlinks are rejected on load.
 
@@ -82,3 +119,5 @@ WebAuthn and recovery-slot unlock, attachments, edits, vault sync, automatic man
 ## License and upstream
 
 GPL-3.0-only; see [LICENSE](LICENSE). The linked [Bramble crypto core](https://github.com/bramble-sh/bramble/tree/7acadf3ef39202b75879b492a771847261341940/packages/core-rust) is GPL-3.0-only and is pinned to revision `7acadf3ef39202b75879b492a771847261341940`. Source for this program and the linked core must accompany distribution as required by the GPL.
+
+The command behavior and recovery states are documented in [the CLI interaction contract](docs/cli-ux.md).

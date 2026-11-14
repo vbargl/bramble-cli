@@ -11,6 +11,8 @@ use std::{
 };
 
 fn fixture(path: &Path) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap();
     vault_crypto::generate_vek().unwrap();
     let salt = vault_crypto::generate_salt().unwrap();
     let id = vault_crypto::generate_slot_id().unwrap();
@@ -45,23 +47,48 @@ fn fixture(path: &Path) {
     fs::write(path, data).unwrap();
     vault_crypto::lock();
 }
-fn start(socket: &Path, vault: &Path) -> Child {
+struct Running(Child);
+impl std::ops::Deref for Running {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Running {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+impl Drop for Running {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+fn start(socket: &Path, vault: &Path) -> Running {
     start_with_options(socket, vault, &[])
 }
-fn start_with_options(socket: &Path, vault: &Path, options: &[&std::ffi::OsStr]) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
-        .arg("--socket")
-        .arg(socket)
-        .arg("daemon")
-        .arg(vault)
-        .args(options)
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
+fn start_with_options(socket: &Path, vault: &Path, options: &[&std::ffi::OsStr]) -> Running {
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
+            .arg("--socket")
+            .arg(socket)
+            .arg("daemon")
+            .arg(vault)
+            .args(options)
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
     for _ in 0..200 {
-        if socket.exists() {
+        if UnixStream::connect(socket).is_ok() {
             return child;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("daemon exited before readiness: {status}");
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -119,7 +146,6 @@ fn lifecycle_with_upstream_vault() {
     );
     daemon.kill().unwrap();
     daemon.wait().unwrap();
-    fs::remove_file(&socket).unwrap();
     let mut daemon = start(&socket, &vault);
     assert_eq!(
         request(&socket, json!({"op":"status"}))["message"],
@@ -134,7 +160,6 @@ fn lifecycle_with_upstream_vault() {
 
     // Exercise the executable's desktop flags, IPC resume, and explicit manual fallback
     // with a desktop that is not running. The local vault remains available independently.
-    fs::remove_file(&socket).unwrap();
     let desktop_socket = dir.path().join("absent-desktop.sock");
     let pairing_file = dir.path().join("absent-pairing.json");
     let mut daemon = start_with_options(
@@ -148,10 +173,9 @@ fn lifecycle_with_upstream_vault() {
             pairing_file.as_os_str(),
         ],
     );
-    assert!(request(&socket, json!({"op":"status"}))["message"]
-        .as_str()
-        .unwrap()
-        .starts_with("sealed ("));
+    let status = request(&socket, json!({"op":"status"}));
+    assert_eq!(status["next"], "pair");
+    assert_eq!(status["ok"], true);
     assert_eq!(request(&socket, json!({"op":"resume"}))["ok"], false);
     assert_eq!(
         request(&socket, json!({"op":"get","id":"entry-1"}))["ok"],
@@ -209,11 +233,313 @@ fn pair_guides_preparation_without_a_daemon_or_runtime_directory() {
     let output = child.wait_with_output().unwrap();
     assert!(!output.status.success());
     let text = String::from_utf8(output.stderr).unwrap();
-    assert!(text.contains("⏳ In desktop Bramble:"));
-    assert!(text.contains("🔒 Compare digits and approve"));
-    assert!(!text.contains("CLI ready"));
-    assert!(!text.contains("Desktop reported"));
-    assert!(text.contains("pairing cancelled"));
+    assert!(text.contains("Run in a terminal:"));
+    assert!(!text.contains("Type yes"));
+    assert!(!text.contains("Enter when ready"));
     assert!(!text.contains("✅ Paired"));
     assert!(!identity.exists());
+}
+
+// Isolated service-manager fixture: commands below can only reach this test's temporary
+// files and synthetic vault. The generated daemon executable itself is real.
+struct ServiceFixture {
+    root: tempfile::TempDir,
+    socket: std::path::PathBuf,
+    vault: std::path::PathBuf,
+}
+impl ServiceFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        for name in ["bin", "config", "data", "runtime", "home"] {
+            fs::create_dir(root.path().join(name)).unwrap();
+            fs::set_permissions(root.path().join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let vault = root.path().join("vault.vlt");
+        fixture(&vault);
+        let socket = root.path().join("runtime/bramble-cli/socket");
+        let script = root.path().join("bin/systemctl");
+        fs::write(&script, r#"#!/bin/sh
+set -eu
+case "$2" in
+  show)
+    case "$*" in
+      *FragmentPath*) printf '%s\n' "$XDG_CONFIG_HOME/systemd/user/bramble-cli.service"; exit 0 ;;
+    esac
+    state=missing
+    if test -f "$TEST_ROOT/state"; then state=$(cat "$TEST_ROOT/state"); fi
+    case "$state" in
+      missing) printf 'LoadState=not-found\nActiveState=inactive\n' ;;
+      stopped) printf 'LoadState=loaded\nActiveState=inactive\n' ;;
+      failed) printf 'LoadState=loaded\nActiveState=failed\n' ;;
+      active) printf 'LoadState=loaded\nActiveState=active\n' ;;
+      *) exit 1 ;;
+    esac ;;
+  daemon-reload|enable) : ;;
+  restart|start)
+    if test "$2" = start && test -f "$TEST_ROOT/pid"; then exit 0; fi
+    if test -f "$TEST_ROOT/pid"; then kill "$(cat "$TEST_ROOT/pid")" 2>/dev/null || true; sleep 0.05; fi
+    "$XDG_DATA_HOME/bramble-cli/bin/bramble-cli" --socket "$TEST_SOCKET" daemon "$TEST_VAULT" >/dev/null 2>"$TEST_ROOT/daemon.log" &
+    printf '%s\n' "$!" >"$TEST_ROOT/pid"
+    printf 'active\n' >"$TEST_ROOT/state" ;;
+  stop)
+    if test -f "$TEST_ROOT/pid"; then kill "$(cat "$TEST_ROOT/pid")" 2>/dev/null || true; rm "$TEST_ROOT/pid"; fi
+    printf 'stopped\n' >"$TEST_ROOT/state" ;;
+  *) exit 1 ;;
+esac
+"#).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            root,
+            socket,
+            vault,
+        }
+    }
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bramble-cli"));
+        let path = std::env::join_paths(
+            std::iter::once(self.root.path().join("bin"))
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        command
+            .env("PATH", path)
+            .env("HOME", self.root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
+            .env("XDG_CONFIG_HOME", self.root.path().join("config"))
+            .env("XDG_DATA_HOME", self.root.path().join("data"))
+            .env("TEST_ROOT", self.root.path())
+            .env("TEST_SOCKET", &self.socket)
+            .env("TEST_VAULT", &self.vault)
+            .env_remove("BRAMBLE_SOCKET");
+        command
+    }
+}
+impl Drop for ServiceFixture {
+    fn drop(&mut self) {
+        if let Ok(pid) = fs::read_to_string(self.root.path().join("pid")) {
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn status_diagnoses_missing_stopped_failed_and_unknown_service_without_prompting() {
+    let fixture = ServiceFixture::new();
+    for (state, expected) in [
+        ("missing", "Daemon service is not installed."),
+        ("stopped", "Daemon service is stopped."),
+        ("failed", "Daemon service failed to start."),
+        ("unknown", "user-service state could not be checked"),
+    ] {
+        fs::write(fixture.root.path().join("state"), state).unwrap();
+        let output = fixture.command().arg("status").output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(expected), "{error}");
+        assert!(!error.contains("os error"));
+        assert!(!error.contains("[i]"));
+        assert!(!fixture
+            .root
+            .path()
+            .join("config/systemd/user/bramble-cli.service")
+            .exists());
+    }
+    let output = fixture
+        .command()
+        .arg("--socket")
+        .arg(fixture.root.path().join("custom.sock"))
+        .arg("status")
+        .output()
+        .unwrap();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("No daemon is listening"));
+    assert!(!error.contains("not installed"));
+    assert!(error.contains("--socket"));
+    // Unseal must diagnose the missing daemon before considering a password prompt.
+    let output = fixture
+        .command()
+        .args(["--no-input", "unseal", "--manual"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(!error.contains("Master password"));
+    assert!(error.contains("Daemon is not running"));
+}
+
+#[test]
+fn service_install_copies_binary_preserves_foreign_units_and_starts_a_real_synthetic_daemon() {
+    let fixture = ServiceFixture::new();
+    let unit = fixture
+        .root
+        .path()
+        .join("config/systemd/user/bramble-cli.service");
+    let output = fixture
+        .command()
+        .args(["service", "install"])
+        .arg(&fixture.vault)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        request(&fixture.socket, json!({"op":"status"}))["message"],
+        "sealed"
+    );
+    let binary = fixture.root.path().join("data/bramble-cli/bin/bramble-cli");
+    assert_eq!(
+        fs::metadata(&binary).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(fs::read_to_string(&unit).unwrap().contains("Type=exec"));
+    let status = fixture.command().arg("status").output().unwrap();
+    assert!(status.status.success());
+    assert!(!status.stderr.windows(3).any(|w| w == b"[i]"));
+    // Reinstallation updates an owned unit and restarts with a fresh sealed process.
+    assert_eq!(
+        request(&fixture.socket, json!({"op":"unseal","password":"correct"}))["ok"],
+        true
+    );
+    let output = fixture
+        .command()
+        .args(["service", "install"])
+        .arg(&fixture.vault)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        request(&fixture.socket, json!({"op":"status"}))["message"],
+        "sealed"
+    );
+    let output = fixture
+        .command()
+        .args(["service", "stop"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(&unit, "# Maintained by the user\n").unwrap();
+    let output = fixture
+        .command()
+        .args(["service", "install"])
+        .arg(&fixture.vault)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not managed by this CLI"));
+    assert_eq!(
+        fs::read_to_string(&unit).unwrap(),
+        "# Maintained by the user\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn interactive_get_resumes_original_request_after_either_setup_route() {
+    use std::os::fd::FromRawFd;
+    for choice in [b"m\n".as_slice(), b"i\n".as_slice()] {
+        let fixture = ServiceFixture::new();
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+        let stdin = unsafe { fs::File::from_raw_fd(slave) };
+        let log = fixture.root.path().join("interaction.log");
+        let mut child = fixture
+            .command()
+            .args(["get", "entry-1"])
+            .stdin(stdin)
+            .stderr(fs::File::create(&log).unwrap())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let wait_for = |needle: &str| {
+            for _ in 0..300 {
+                let text = fs::read_to_string(&log).unwrap();
+                if text.contains(needle) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "Missing prompt {needle}: {}",
+                fs::read_to_string(&log).unwrap()
+            );
+        };
+        wait_for("[i] Install user service");
+        terminal.write_all(choice).unwrap();
+        let mut daemon = if choice == b"m\n" {
+            wait_for("Enter once it is running");
+            Some(start(&fixture.socket, &fixture.vault))
+        } else {
+            // The sole desktop vault is selected without asking for a UUID path.
+            // This fixture intentionally has no desktop vault discovery entry yet: installation
+            // asks for the fallback file, and that selection remains a user action.
+            wait_for("Vault path or number");
+            writeln!(terminal, "{}", fixture.vault.display()).unwrap();
+            wait_for("Enter once ready to retry");
+            None
+        };
+        assert_eq!(
+            request(&fixture.socket, json!({"op":"unseal","password":"correct"}))["ok"],
+            true
+        );
+        terminal.write_all(b"\n").unwrap();
+        for _ in 0..300 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+            panic!("get did not resume");
+        }
+        let output = child.wait_with_output().unwrap();
+        if let Some(daemon) = &mut daemon {
+            daemon.kill().unwrap();
+            daemon.wait().unwrap();
+        }
+        assert!(
+            output.status.success(),
+            "{}",
+            fs::read_to_string(&log).unwrap()
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "synthetic-password\n"
+        );
+        assert!(!fs::read_to_string(&log)
+            .unwrap()
+            .contains("synthetic-password"));
+        assert_eq!(
+            fixture
+                .root
+                .path()
+                .join("config/systemd/user/bramble-cli.service")
+                .exists(),
+            choice == b"i\n"
+        );
+    }
 }

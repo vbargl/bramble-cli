@@ -531,6 +531,7 @@ fn guide_waits_for_desktop_preparation_then_pairs() {
         &desktop.identity(),
         &mut input,
         &mut output,
+        true,
     )
     .unwrap();
     let output = String::from_utf8(output).unwrap();
@@ -554,6 +555,7 @@ fn guide_handles_missing_desktop_and_closed_input_without_claiming_success() {
             &root.path().join("client.json"),
             &mut std::io::Cursor::new(input),
             &mut output,
+            true,
         )
         .unwrap_err();
         assert!(error.contains("cancelled"));
@@ -585,6 +587,7 @@ fn guide_checks_existing_pairing_and_waits_for_unlock_without_replacing_credenti
         &desktop.identity(),
         &mut input,
         &mut output,
+        true,
     )
     .unwrap();
     let output = String::from_utf8(output).unwrap();
@@ -597,6 +600,7 @@ fn guide_checks_existing_pairing_and_waits_for_unlock_without_replacing_credenti
         &desktop.identity(),
         &mut std::io::Cursor::new(b""),
         &mut Vec::new(),
+        true,
     )
     .unwrap_err();
     assert!(
@@ -614,10 +618,32 @@ fn guide_never_treats_enter_as_approval() {
         &desktop.socket,
         &desktop.identity(),
         &mut std::io::Cursor::new(b"\n"),
-        &mut output
+        &mut output,
+        true,
     )
     .unwrap_err()
     .contains("cancelled"));
     assert!(!desktop.identity().exists());
     assert!(!String::from_utf8(output).unwrap().contains("✅ Paired"));
+}
+
+#[test]
+fn daemon_socket_restart_preserves_live_daemons_and_unrelated_files() {
+    let root = tempfile::tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = root.path().join("socket");
+    let (listener, lock) = bind_daemon(&socket).unwrap();
+    assert!(bind_daemon(&socket).is_err());
+    assert!(UnixStream::connect(&socket).is_ok());
+    drop(listener);
+    drop(lock);
+    // Simulate a crash: the old socket file remains but has no live listener.
+    let (listener, lock) = bind_daemon(&socket).unwrap();
+    assert!(UnixStream::connect(&socket).is_ok());
+    drop(listener);
+    drop(lock);
+    fs::remove_file(&socket).unwrap();
+    fs::write(&socket, "unrelated file").unwrap();
+    assert!(bind_daemon(&socket).is_err());
+    assert_eq!(fs::read_to_string(&socket).unwrap(), "unrelated file");
 }

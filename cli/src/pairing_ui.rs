@@ -27,7 +27,14 @@ fn retry(
     out: &mut impl Write,
     action: &str,
     next: Option<&str>,
+    interactive: bool,
 ) -> Result<()> {
+    if !interactive {
+        return Err(format!(
+            "{action}\n⏳ Run in a terminal: {}",
+            crate::guidance::command(None, &["pair"])
+        ));
+    }
     show(out, &[&format!("⏳ {action}")])?;
     if let Some(next) = next {
         show(out, &[&format!("🔒 {next}")])?;
@@ -44,6 +51,7 @@ pub fn run(
     identity: &Path,
     input: &mut impl BufRead,
     out: &mut impl Write,
+    interactive: bool,
 ) -> Result<()> {
     // Treat symlinks and unreadable/corrupt files as existing too: never silently overwrite.
     let existing = match identity.symlink_metadata() {
@@ -67,7 +75,13 @@ pub fn run(
                     return show(out, &["✅ Paired; ready to use"]);
                 }
                 Ok(reply) if reply["error"] == "locked" => {
-                    retry(input, out, "Unlock your vault in desktop Bramble.", None)?;
+                    retry(
+                        input,
+                        out,
+                        "Unlock your vault in desktop Bramble.",
+                        None,
+                        interactive,
+                    )?;
                 }
                 Ok(_) => {
                     return Err(format!("Open the vault originally paired with this CLI. To pair again, disconnect Bramble CLI in desktop Bramble, move {} aside and rerun pair.", identity.display()));
@@ -77,9 +91,16 @@ pub fn run(
                     out,
                     "Open desktop Bramble and unlock your paired vault.",
                     None,
+                    interactive,
                 )?,
             }
         }
+    }
+    if !interactive {
+        return Err(format!(
+            "Pairing needs your confirmation.\n⏳ Run in a terminal: {}",
+            crate::guidance::command(None, &["pair"])
+        ));
     }
     loop {
         let mut comparing = false;
@@ -113,6 +134,7 @@ pub fn run(
                 out,
                 "In desktop Bramble: unlock vault → Settings → Browser extension → Connect.",
                 Some("Compare digits and approve"),
+                interactive,
             )?,
         }
     }

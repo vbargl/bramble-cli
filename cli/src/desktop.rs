@@ -261,6 +261,13 @@ impl Session {
 }
 
 pub fn request(socket: &Path, pairing_file: &Path, body: Value) -> Result<Value, String> {
+    match fs::symlink_metadata(pairing_file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("desktop: not paired".into())
+        }
+        Err(e) => return Err(format!("Cannot inspect desktop pairing credentials: {e}")),
+        Ok(_) => (),
+    }
     let identity = Identity::load(pairing_file)?;
     Session::connect(socket, &identity)?.request(body)
 }
