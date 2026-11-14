@@ -121,7 +121,6 @@ enum NextAction {
     OpenDesktop,
     OpenPairedVault,
     ManualList,
-    Hostname,
     SelectEntry,
     SelectVault,
 }
@@ -351,31 +350,36 @@ fn access_failure(e: String) -> Response {
         Some(NextAction::OpenDesktop)
     } else if e.starts_with("desktop lookup requires") {
         Some(NextAction::ManualList)
-    } else if e.starts_with("hostname lookup requires") {
-        Some(NextAction::Hostname)
     } else if e == "entry not found" || e == "desktop: unknown entry" {
         Some(NextAction::SelectEntry)
     } else {
         None
     };
-    let message = match next {
-        Some(NextAction::Unseal) => "Daemon is sealed.".to_owned(),
-        Some(NextAction::Pair) => "The CLI is not paired with this desktop vault.".to_owned(),
-        Some(NextAction::OpenDesktop) => {
-            "Desktop Bramble is unavailable or its vault is locked.".to_owned()
+    let message = if e == "desktop: vault changed" {
+        "Desktop vault changed during the request. Retry after selecting the intended vault in desktop Bramble.".to_owned()
+    } else if e == "desktop: wrong vault" {
+        "The selected vault is not active in desktop Bramble.".to_owned()
+    } else if e == "desktop: cannot identify vault" {
+        "The active desktop vault could not be identified.".to_owned()
+    } else {
+        match next {
+            Some(NextAction::Unseal) => "Daemon is sealed.".to_owned(),
+            Some(NextAction::Pair) => "The CLI is not paired with this desktop vault.".to_owned(),
+            Some(NextAction::OpenDesktop) => {
+                "Desktop Bramble is unavailable or its vault is locked.".to_owned()
+            }
+            Some(NextAction::OpenPairedVault) => {
+                "The open desktop vault is not paired with this CLI.".to_owned()
+            }
+            Some(NextAction::ManualList) => {
+                "Desktop access can list logins by hostname only.".to_owned()
+            }
+            Some(NextAction::SelectEntry) => {
+                "Entry was not found in any unsealed vault.".to_owned()
+            }
+            Some(NextAction::SelectVault) => "Choose the vault to change.".to_owned(),
+            None => e,
         }
-        Some(NextAction::OpenPairedVault) => {
-            "The open desktop vault is not paired with this CLI.".to_owned()
-        }
-        Some(NextAction::ManualList) => {
-            "Desktop access can list logins by hostname only.".to_owned()
-        }
-        Some(NextAction::Hostname) => {
-            "The local vault is manually unsealed; hostname lookup uses desktop access.".to_owned()
-        }
-        Some(NextAction::SelectEntry) => "Entry was not found in any unsealed vault.".to_owned(),
-        Some(NextAction::SelectVault) => "Choose the vault to change.".to_owned(),
-        None => e,
     };
     Response {
         protocol: 2,
@@ -529,8 +533,7 @@ fn call(mut stream: UnixStream, mut request: Request) -> Result<Response, String
         .read_line(&mut line)
         .map_err(|_| "Daemon did not answer. Check its terminal, or run: journalctl --user -u bramble-cli.service -n 20 --no-pager".to_owned())?;
     let response: Result<Response, String> = serde_json::from_str(&line).map_err(|_| {
-        "Daemon returned an invalid response. Restart the daemon with the same CLI version."
-            .to_owned()
+        "Daemon returned an invalid response. Restart the daemon using this build.".to_owned()
     });
     line.zeroize();
     let mut response = response?;
@@ -567,7 +570,6 @@ fn next_command(next: NextAction, socket: &Path, vault: Option<&Path>) -> String
             "Use list --hostname HOST, or run {} for a full list.",
             guidance::command(Some(socket), &manual)
         ),
-        NextAction::Hostname => "Omit --hostname to list the local vault.".into(),
         NextAction::SelectEntry => {
             "Use an ID from list (with --hostname HOST when using desktop access).".into()
         }

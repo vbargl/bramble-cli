@@ -715,6 +715,7 @@ fn desktop_vault_switch_cannot_serve_a_secret_for_the_previous_vault() {
     );
     assert!(!response.ok);
     assert!(!response.message.contains("desktop-password"));
+    assert!(response.message.contains("changed during the request"));
     assert!(matches!(response.next, Some(NextAction::OpenPairedVault)));
     // A per-vault seal does not disable a different desktop vault.
     assert!(
