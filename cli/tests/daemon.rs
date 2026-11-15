@@ -639,12 +639,14 @@ fn multiple_vaults_query_together_and_mutate_independently() {
     let output = Command::new(env!("CARGO_BIN_EXE_bramble-cli"))
         .arg("--socket")
         .arg(&socket)
-        .arg("list")
+        .args(["--json", "list"])
         .output()
         .unwrap();
     assert!(output.status.success());
     assert!(output.stderr.is_empty()); // No vault selection for a query.
-    let rows: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["ok"], true);
+    let rows = document["data"]["entries"].clone();
     assert_eq!(rows.as_array().unwrap().len(), 4);
     assert!(rows
         .as_array()

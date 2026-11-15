@@ -2,7 +2,7 @@
 
 Source and releases: [vbargl/bramble-cli](https://github.com/vbargl/bramble-cli).
 
-A single-user daemon that reads Bramble passwords. Start it independently of any vault,
+A single-user daemon that reads Bramble entries and, for manually unsealed vaults, saves them. Start it independently of any vault,
 then use the unlocked desktop app or manually unseal one or more vault files. Queries
 search every unsealed vault. `seal` changes access to one vault in this daemon; it does
 not lock desktop Bramble or other devices.
@@ -13,7 +13,7 @@ Rust and Cargo are required. On Nix, `nix-shell nix/shell.nix --run 'just build'
 the toolchain. Otherwise run `just build` with Rust, Cargo and [just](https://just.systems/)
 installed. The binary is `cli/target/release/bramble-cli`. Cargo fetches the Bramble crypto
 core at the exact revision recorded in `cli/Cargo.lock`; the first build needs network
-access. `just test` runs protocol, lifecycle and synthetic-vault tests; `just check` checks
+access. `just test` runs protocol, lifecycle, entry-editing and synthetic-vault tests; `just check` checks
 formatting and compilation.
 
 ## NixOS installations
@@ -116,24 +116,138 @@ locks or exits. A daemon restart discards all manual keys and per-vault desktop 
 ```sh
 bramble-cli list
 bramble-cli list --hostname example.com
-bramble-cli get ENTRY_ID
+bramble-cli get ENTRY_ID                      # the password, as before
+bramble-cli get ENTRY_ID -f username          # one field: just its value
+bramble-cli get ENTRY_ID -f title -f url      # several: NAME<TAB>VALUE per line
+bramble-cli get ENTRY_ID -f 'field:API key'   # a custom field, by exact name
 ```
 
-`list` merges metadata across all unsealed vaults into a JSON array with `id`, `name` and
-`vault` fields. `get` searches those vaults for an exact entry ID and prints only its
-password to stdout. Neither command requires a vault argument or selection. Guidance
-and prompts go to stderr so passwords and JSON remain usable in pipes.
+`list` prints an aligned `ID  TITLE  VAULT` table across all unsealed vaults, sorted by
+vault and title. It never shows secret values. Titles and vault names are shortened to
+fit a terminal; redirected output is never shortened, and IDs never are. Use `--json`
+for machine-readable output. Neither `list` nor `get` requires a vault argument.
 
-A desktop-backed source supports exact hostname lookup of logins, not full enumeration.
-If one is in use, `list` needs `--hostname HOST`, or that vault must be manually unsealed
-for a full list. Local hostname queries use login `urls` and exact hostname matching,
-excluding archived entries and mobile-app URI schemes. A manual key for the same vault
-takes precedence over its desktop route, avoiding duplicate results.
+`get` selects fields with repeatable `-f/--field`: `title`, `username`, `password`,
+`url` (the first), `urls` (all, one per line), `notes`, `totp` and `field:NAME` for a
+custom field. With no `-f` it prints only the password, exactly as before. One field
+prints its bare value; several print `name<TAB>value` lines in the order requested, with
+newlines in values written as `\n` (use `--json` for exact values). A field the entry
+does not have is an error (`field_not_found`, exit 3) and prints nothing; an empty value
+is a value. Unknown field names are rejected. If a custom field name is duplicated in an
+entry, the first is returned. Guidance and prompts go to stderr, so values stay usable
+in pipes.
+
+A desktop-backed source returns only `username`, `password` and `totp` from `get`, and
+supports exact hostname lookup of logins, not full enumeration. Other fields
+(`field_unsupported`) and an unfiltered `list` (`list_unsupported`) need the vault to
+be unsealed manually, or `--hostname HOST` for `list`. Local hostname queries use login
+`urls` and exact hostname matching, excluding archived entries and mobile-app URI
+schemes. A manual key for the same vault takes precedence over its desktop route,
+avoiding duplicate results.
 
 If independent vaults contain the same entry ID (for example, after copying a vault),
 `list` qualifies those IDs as `/absolute/vault.vlt::ENTRY_ID`. Pass the complete returned
-ID to `get`. A bare ambiguous ID is rejected instead of selecting a vault silently.
-Protect terminal output and any pipes or files receiving passwords.
+ID to `get` or `save`. A bare ambiguous ID is rejected (`ambiguous_entry`) instead of
+selecting a vault silently. Protect terminal output and any pipes or files receiving
+passwords.
+
+## Create and update entries
+
+```sh
+bramble-cli save --title GitHub --username octocat --password-stdin \
+    --url https://github.com --notes 'work account' < password.txt   # create; prints the new ID
+bramble-cli save ENTRY_ID --password-stdin < new-password.txt        # change one field
+bramble-cli save ENTRY_ID --field Region=eu --secret-field Token=t0k # custom fields
+bramble-cli save ENTRY_ID --clear notes --clear 'field:Region'       # remove values
+bramble-cli save --title Mail --vault Work                           # pick the vault
+```
+
+Without an ID, `save` creates a login (a title is required); with an ID it updates that
+entry and **keeps every field you do not mention**, including data the CLI does not
+edit (tags, passkeys, one-time-password secrets, attachments). It prints the entry's ID.
+Re-saving identical values changes nothing and does not rewrite the vault.
+
+| Option | Effect |
+| --- | --- |
+| `--title`, `--username`, `--notes` | Set the value. |
+| `--password VALUE` / `--password-stdin` | Set the password. The first is visible in the process list; prefer the second. |
+| `--url URL` (repeatable) | Replace the entry's whole URL list. |
+| `--field NAME=VALUE`, `--secret-field NAME=VALUE` | Create or update a custom field by its exact name. `--secret-field` also hides it. An existing field keeps its hidden flag unless `--secret-field` is used. Duplicate names are refused, not guessed. |
+| `--clear FIELD` | Remove `username`, `password`, `url`, `notes` or `field:NAME`. Username and password become empty; the title cannot be cleared. Setting and clearing one field together is an error. Clearing an absent custom field does nothing. |
+| `--input FILE` / `--input -` | Read fields from a JSON document (see below); options override it. |
+| `--vault V` | Vault name, ID or path. |
+
+The input document uses the same names: `{"id": "...", "vault": "...", "title": "...",
+"username": "...", "password": "...", "urls": ["..."], "notes": "...", "fields":
+{"Region": "eu", "Token": {"value": "t0k", "hidden": true}}, "clear": ["notes"]}`.
+Unknown keys are rejected. Only login entries have a username, password and URLs.
+
+**Which vault.** A new entry goes to the only unsealed vault. With several, pass
+`--vault` or, on a terminal, choose by number; a script gets `ambiguous_vault` with the
+candidates. An update goes to the one vault holding that ID; if several do, use the
+scoped ID from `list` (`ambiguous_entry`).
+
+**Where saving works.** Writing is supported only for vaults unsealed **manually**
+(`unseal VAULT --manual`), because the CLI edits the local `.vlt` file itself. Desktop
+access is read-only: the desktop bridge exposes query and fetch, not writes
+(`write_unsupported`). The desktop also keeps its own copy of the open vault and its sync
+state, so the CLI **refuses to write a vault that the paired desktop currently has open
+and unlocked** (`desktop_active`); lock desktop Bramble or switch it to another vault,
+then retry. When the desktop is not configured for this daemon (no `--desktop`) or not
+paired, the CLI cannot tell whether it has the vault open; do not save while it does.
+
+**How it is written.** Only the encrypted entries payload is rewritten. Key slots (even
+kinds this CLI cannot read), other entries and unknown payload members (deletion
+records, settings, file manifests) are preserved. The new file is written next to the
+old one, decrypted again and compared with what was intended, and only then renamed over
+the vault; if the file changed since it was read, nothing is written
+(`changed_externally`). Any failure leaves the original untouched. An entry with
+unresolved sync conflicts is not edited (`conflict_pending`).
+
+**Sync.** Saved entries are stamped as written by `bramble-cli` at the current time, so
+they win over the version they replace, and carry no per-field history, so a desktop
+treats the whole entry as changed. This follows Bramble's internal format at the pinned
+revision but has only been tested against synthetic vaults and format rules; **try
+`save` on a copy of a vault that syncs before relying on it**, and keep backups. The CLI
+does not record superseded passwords in the entry's password history.
+
+## JSON mode for tools
+
+Add the global `--json` option to `get`, `list`, `save`, `status`, `seal` and `unseal`.
+It never prompts, ignores whether stdin or stdout is a terminal, writes **exactly one
+JSON document to stdout** (no colors, no guidance) and nothing to stderr.
+
+```json
+{"ok": true,  "command": "get",  "data": {"id": "e1", "vault": "Personal", "fields": {"username": "ada"}}}
+{"ok": true,  "command": "list", "data": {"entries": [{"id": "e1", "name": "Example", "vault": "Personal"}]}}
+{"ok": true,  "command": "save", "data": {"id": "e1", "vault": "Personal", "created": false, "changed": true}}
+{"ok": false, "command": "get",  "error": {"code": "sealed", "message": "Daemon is sealed.",
+  "next": [{"message": "Unseal the vault:", "command": "bramble-cli unseal"}]}}
+```
+
+`get` in JSON mode returns the requested fields (the password by default) under
+`fields`; `urls` is an array. `status` returns `message` and `vaults` (`name`, `path`,
+`access`: `manual`, `desktop` or `sealed`); `seal` and `unseal` return `message`. An
+error has a stable `code`, a `message`, optional `next` actions (a `message` and, when
+there is one, the `command` to run), `choices` (candidate vaults) and `details` (for
+`ambiguous_entry`, the scoped `ids`). Branch on `ok`, `error.code` or the exit status,
+not on message text. New keys may be added; documented keys and codes are not changed
+or reused within a release series.
+
+Exit statuses are the same in plain and JSON mode: `0` success; `1` other failure
+(`error`, `write_failed`, `changed_externally`, `conflict_pending`, `daemon_connection`,
+`daemon_outdated`); `2` invalid usage or input (`invalid_usage`, `invalid_input`);
+`3` not found (`entry_not_found`, `field_not_found`, `vault_not_found`); `4` access
+unavailable (`sealed`, `desktop_locked`, `desktop_unavailable`, `not_paired`,
+`wrong_vault`, `vault_unidentified`, `daemon_unavailable`, `desktop_active`); `5`
+ambiguous (`ambiguous_entry`, `ambiguous_vault`); `6` unsupported (`unsupported`,
+`list_unsupported`, `field_unsupported`, `write_unsupported`); `7` a person is needed
+(`interactive_required`, for example a manual unseal password). `--help` and `--version`
+stay plain text.
+
+`daemon`, `service` and `pair` are interactive or run in the foreground and answer
+`--json` with `unsupported`. The daemon's wire protocol is version 3; restart or
+reinstall an older daemon.
 
 ## Services and paths
 
@@ -188,7 +302,7 @@ keys persist in the private file; manual vault encryption keys never do.
 Desktop access uses Bramble's login/autofill index and internal protocol v1 at the pinned
 upstream revision. It is not a stable public API. Tests use synthetic vaults and an
 independent protocol peer with upstream crypto; real desktop pairing still needs human
-confirmation. Attachments, edits, vault sync, recovery/WebAuthn-slot unlock, automatic
+confirmation. Attachments, editing entry types other than logins' basic fields, vault sync, recovery/WebAuthn-slot unlock, automatic
 manual unlock, timeout and threshold sharing are not implemented. The desktop decides
 its own lock timeout.
 

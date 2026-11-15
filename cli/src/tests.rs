@@ -335,6 +335,9 @@ fn sas_matches_upstream_published_vector() {
     );
 }
 
+/// The crypto core has one global key slot; tests that unseal a local vault take turns.
+static CRYPTO: Mutex<()> = Mutex::new(());
+
 fn fixture(path: &Path) {
     vault_crypto::generate_vek().unwrap();
     let salt = vault_crypto::generate_salt().unwrap();
@@ -371,6 +374,7 @@ fn fixture(path: &Path) {
 
 #[test]
 fn desktop_lock_seal_revocation_and_manual_fallback() {
+    let _crypto = CRYPTO.lock().unwrap_or_else(|e| e.into_inner());
     let desktop = Desktop::new(true);
     desktop.pair();
     let vault = desktop.root.path().join("vaults/vault.vlt");
@@ -383,7 +387,8 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert_eq!(
         handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -406,7 +411,8 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert!(
         !handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -419,7 +425,8 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert_eq!(
         handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -438,7 +445,8 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert!(
         !handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -459,7 +467,8 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert!(
         !handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -471,7 +480,8 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert!(
         !handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -509,7 +519,8 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert_eq!(
         handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -524,7 +535,8 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert_eq!(
         handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -540,7 +552,8 @@ fn desktop_lock_seal_revocation_and_manual_fallback() {
     assert!(
         !handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -711,6 +724,7 @@ fn desktop_vault_switch_cannot_serve_a_secret_for_the_previous_vault() {
     let response = handle(
         Request::Get {
             id: "entry-1".into(),
+            fields: Vec::new(),
         },
         &mut state,
     );
@@ -731,7 +745,8 @@ fn desktop_vault_switch_cannot_serve_a_secret_for_the_previous_vault() {
     assert_eq!(
         handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -746,7 +761,8 @@ fn desktop_vault_switch_cannot_serve_a_secret_for_the_previous_vault() {
     assert!(
         !handle(
             Request::Get {
-                id: "entry-1".into()
+                id: "entry-1".into(),
+                fields: Vec::new()
             },
             &mut state
         )
@@ -767,4 +783,105 @@ fn desktop_vault_switch_cannot_serve_a_secret_for_the_previous_vault() {
         )
         .ok
     );
+}
+
+fn get_fields(state: &mut State, fields: &[&str]) -> Response {
+    handle(
+        Request::Get {
+            id: "entry-1".into(),
+            fields: fields.iter().map(|f| f.to_string()).collect(),
+        },
+        state,
+    )
+}
+
+#[test]
+fn desktop_access_serves_only_the_fields_the_desktop_protocol_returns() {
+    let desktop = Desktop::new(true);
+    desktop.pair();
+    let mut state = State::new(Some((desktop.socket.clone(), desktop.identity())));
+    let found = get_fields(&mut state, &["username", "password"]);
+    assert!(found.ok, "{}", found.message);
+    let data = found.data.unwrap();
+    assert_eq!(data["fields"]["username"], "alice");
+    assert_eq!(data["fields"]["password"], "desktop-password");
+    assert_eq!(data["vault"], "Desktop vault");
+    // Fields the desktop never returns are reported as unsupported, with a way forward.
+    let unsupported = get_fields(&mut state, &["password", "notes"]);
+    assert!(!unsupported.ok);
+    assert_eq!(unsupported.code.as_deref(), Some("field_unsupported"));
+    assert!(matches!(unsupported.next, Some(NextAction::ManualUnseal)));
+    assert!(!unsupported.message.contains("desktop-password"));
+    // A supported field the entry lacks is missing, not empty.
+    let missing = get_fields(&mut state, &["totp"]);
+    assert_eq!(missing.code.as_deref(), Some("field_not_found"));
+    // Enumeration is not available over desktop access, and says so with a stable code.
+    let list = handle(Request::List { hostname: None }, &mut state);
+    assert_eq!(list.code.as_deref(), Some("list_unsupported"));
+    assert!(matches!(list.next, Some(NextAction::ManualList)));
+}
+
+#[test]
+fn saving_never_writes_through_the_desktop_or_beneath_an_open_desktop_vault() {
+    let _crypto = CRYPTO.lock().unwrap_or_else(|e| e.into_inner());
+    let desktop = Desktop::new(true);
+    desktop.pair();
+    let vault = desktop.root.path().join("vaults/vault.vlt");
+    fixture(&vault);
+    let original = fs::read(&vault).unwrap();
+    let mut state = State::new(Some((desktop.socket.clone(), desktop.identity())));
+    let create = || Request::Save {
+        id: None,
+        vault: None,
+        change: entry::Change {
+            title: Some("New".into()),
+            ..Default::default()
+        },
+    };
+    // Desktop access alone is read-only.
+    let response = handle(create(), &mut state);
+    assert_eq!(response.code.as_deref(), Some("write_unsupported"));
+    assert!(matches!(response.next, Some(NextAction::ManualUnseal)));
+    let update = handle(
+        Request::Save {
+            id: Some("entry-1".into()),
+            vault: None,
+            change: entry::Change {
+                notes: Some("x".into()),
+                ..Default::default()
+            },
+        },
+        &mut state,
+    );
+    assert_eq!(update.code.as_deref(), Some("write_unsupported"));
+    // A manual key makes the file writable, but not while the desktop has it open: it keeps
+    // its own copy and sync state.
+    let unsealed = handle(
+        Request::Unseal {
+            vault: Some(vault.clone()),
+            password: "correct".into(),
+        },
+        &mut state,
+    );
+    assert!(unsealed.ok, "{}", unsealed.message);
+    let response = handle(create(), &mut state);
+    assert_eq!(response.code.as_deref(), Some("desktop_active"));
+    assert!(matches!(response.next, Some(NextAction::LockDesktop)));
+    assert_eq!(fs::read(&vault).unwrap(), original);
+    // Once the desktop locks, nothing holds the vault and the save goes through.
+    desktop.locked.store(true, Ordering::SeqCst);
+    let response = handle(create(), &mut state);
+    assert!(response.ok, "{}", response.message);
+    assert_eq!(response.data.as_ref().unwrap()["created"], true);
+    assert_ne!(fs::read(&vault).unwrap(), original);
+    // The saved entry reads back through the manual key.
+    let id = response.data.unwrap()["id"].as_str().unwrap().to_owned();
+    let read = handle(
+        Request::Get {
+            id,
+            fields: vec!["title".into()],
+        },
+        &mut state,
+    );
+    assert_eq!(read.data.unwrap()["fields"]["title"], "New");
 }

@@ -1,6 +1,10 @@
 //! Recover prerequisites one step at a time. Read-only commands and non-TTY callers never
 //! install services, start processes, or wait for interactive input.
-use crate::{desktop, service, terminal};
+use crate::{
+    desktop,
+    output::{CliError, Step},
+    service, terminal,
+};
 use std::{
     ffi::OsStr,
     io::{self, Write},
@@ -64,22 +68,27 @@ pub fn read_answer(prompt: &str) -> Result<String, String> {
 pub fn choose_vault(
     choices: &[crate::vaults::Choice],
     interactive: bool,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, CliError> {
     if let [choice] = choices {
         return Ok(choice.path.clone());
     }
     if choices.is_empty() {
-        return Err("No vault was found. Open or restore a vault in desktop Bramble, or supply its .vlt path to unseal.".into());
+        return Err(CliError::new("vault_not_found", "No vault was found. Open or restore a vault in desktop Bramble, or supply its .vlt path to unseal."));
     }
     if !interactive {
-        return Err(format!(
-            "Choose the vault to change by supplying its name, ID or path.\n{}",
+        return Err(CliError::new(
+            "ambiguous_vault",
+            "Several vaults are available. Choose one by supplying its name, ID or path.",
+        )
+        .steps(vec![Step::text(format!(
+            "Available vaults:\n{}",
             choices
                 .iter()
                 .map(|v| format!("  {} ({})", v.name, v.path.display()))
                 .collect::<Vec<_>>()
                 .join("\n")
-        ));
+        ))])
+        .choices(choices.to_vec()));
     }
     eprintln!("Choose the vault:\n");
     for (i, vault) in choices.iter().enumerate() {
@@ -111,76 +120,78 @@ pub fn choose_vault(
     }
 }
 
-pub fn unavailable(error: &io::Error, socket: &Path, managed: bool) -> String {
+pub fn unavailable(error: &io::Error, socket: &Path, managed: bool) -> CliError {
     use io::ErrorKind;
+    let fail = |message: String, steps: Vec<Step>| {
+        CliError::new("daemon_unavailable", message).steps(steps)
+    };
     if error.kind() == ErrorKind::PermissionDenied {
-        return terminal::recovery(
-            &format!("Cannot access the daemon at {}.", socket.display()),
-            &[
-                "Use the same user account as the daemon and check this socket's permissions."
-                    .into(),
-            ],
+        return fail(
+            format!("Cannot access the daemon at {}.", socket.display()),
+            vec![Step::text(
+                "Use the same user account as the daemon and check this socket's permissions.",
+            )],
         );
     }
     if !matches!(
         error.kind(),
         ErrorKind::NotFound | ErrorKind::ConnectionRefused
     ) {
-        return format!(
-            "Cannot connect to the daemon at {}: {error}",
-            socket.display()
+        return fail(
+            format!(
+                "Cannot connect to the daemon at {}: {error}",
+                socket.display()
+            ),
+            Vec::new(),
         );
     }
-    let manual = terminal::action(
+    let manual = Step::run(
         "Run in another terminal:",
-        &command(Some(socket), &["daemon", "--desktop"]),
+        command(Some(socket), &["daemon", "--desktop"]),
     );
     if !managed {
-        return terminal::recovery(
-            &format!("No daemon is listening at {}.", socket.display()),
-            &[manual],
+        return fail(
+            format!("No daemon is listening at {}.", socket.display()),
+            vec![manual],
         );
     }
+    let log = || {
+        Step::run(
+            "Check the service log:",
+            "journalctl --user -u bramble-cli.service -n 20 --no-pager",
+        )
+    };
     match service::state() {
-        service::State::Missing => terminal::recovery(
-            "Daemon service is not installed.",
-            &[
-                terminal::action(
+        service::State::Missing => fail(
+            "Daemon service is not installed.".into(),
+            vec![
+                Step::run(
                     "Install and start the service:",
-                    &command(Some(socket), &["service", "install", "--desktop"]),
+                    command(Some(socket), &["service", "install", "--desktop"]),
                 ),
                 manual,
             ],
         ),
-        service::State::Stopped => terminal::recovery(
-            "Daemon service is stopped.",
-            &[terminal::action(
+        service::State::Stopped => fail(
+            "Daemon service is stopped.".into(),
+            vec![Step::run(
                 "Start the service:",
-                &command(Some(socket), &["service", "start"]),
+                command(Some(socket), &["service", "start"]),
             )],
         ),
-        service::State::Failed => terminal::recovery(
-            "Daemon service failed to start.",
-            &[terminal::action(
-                "Check the service log:",
-                "journalctl --user -u bramble-cli.service -n 20 --no-pager",
-            )],
+        service::State::Failed => fail("Daemon service failed to start.".into(), vec![log()]),
+        service::State::Active => fail(
+            "Daemon service is running but is not responding at this socket.".into(),
+            vec![log()],
         ),
-        service::State::Active => terminal::recovery(
-            "Daemon service is running but is not responding at this socket.",
-            &[terminal::action(
-                "Check the service log:",
-                "journalctl --user -u bramble-cli.service -n 20 --no-pager",
-            )],
-        ),
-        service::State::Unknown => terminal::recovery(
-            "Daemon is not running; user-service state could not be checked.",
-            &[manual],
+        service::State::Unknown => fail(
+            "Daemon is not running; user-service state could not be checked.".into(),
+            vec![manual],
         ),
     }
 }
 
-pub fn connect(socket: &Path, managed: bool, interactive: bool) -> Result<UnixStream, String> {
+pub fn connect(socket: &Path, managed: bool, interactive: bool) -> Result<UnixStream, CliError> {
     loop {
         let error = match UnixStream::connect(socket) {
             Ok(stream) => return Ok(stream),
@@ -200,7 +211,7 @@ pub fn connect(socket: &Path, managed: bool, interactive: bool) -> Result<UnixSt
             service::State::Unknown
         };
         let problem = unavailable(&error, socket, managed);
-        let heading = problem.lines().next().unwrap_or("Daemon is unavailable.");
+        let heading = problem.message.as_str();
         let choice = if state == service::State::Missing {
             terminal::error(&terminal::recovery(
                 heading,
@@ -217,7 +228,7 @@ pub fn connect(socket: &Path, managed: bool, interactive: bool) -> Result<UnixSt
             ));
             read_answer("\n  Choose s or m (q to cancel): ")?
         } else {
-            terminal::error(&problem);
+            terminal::error(&problem.plain());
             read_answer("\n  Enter once ready to retry · q to cancel: ")?;
             continue;
         };

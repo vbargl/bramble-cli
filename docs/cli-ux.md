@@ -45,6 +45,18 @@ socket and connection options in suggested follow-up commands.
   prerequisite before attempting later steps. Do not prompt for passwords as a surprise
   side effect. Keep passwords and JSON on stdout; guidance goes to stderr. Reject a
   bare duplicate entry ID; list supplies source-qualified IDs for that case.
+- `get ID [-f FIELD]...` prints the password by default, one field's bare value, or
+  `name<TAB>value` lines in request order. A missing field is an error with no partial
+  output; an empty value is a value. `list` prints an aligned `ID  TITLE  VAULT` table
+  without secrets: IDs are never shortened, titles and vault names are shortened only for
+  a terminal. Neither styles stdout.
+- `save [ID]` creates (title required) or updates, keeping every field not named.
+  Clearing is only explicit (`--clear`). It prints the entry ID on stdout and a short
+  result on stderr. It never replays a request, because the request carries secrets.
+  It writes only manually unsealed vaults and explains when desktop access cannot write
+  or the desktop has the vault open. A new entry follows the multi-vault rule below:
+  infer the sole unsealed vault, else ask by number on a terminal, else fail with the
+  candidates and `--vault`.
 - `seal [VAULT]` affects only the selected vault's CLI access, including its desktop
   route. It does not lock another vault, desktop Bramble or another device.
 - Prompt only on a terminal; closed input cancels. An empty response never approves
@@ -58,6 +70,18 @@ socket and connection options in suggested follow-up commands.
   from errors, and do not print routine connection events or duplicate checklists.
 - Honor `NO_COLOR`, `TERM=dumb` and stderr's own TTY state. Hierarchy must still work
   without color, and application data on stdout is never styled.
+
+## JSON mode
+
+`--json` is a global option rather than a separate command, so one command line differs
+from its human form only by that flag. It implies `--no-input`, prints exactly one JSON
+document on stdout for success and failure, and prints nothing on stderr. Failures carry
+a stable `error.code`, `message`, optional `next` actions (`message` plus `command`),
+`choices` and `details`, and the exit status is the same as in plain mode: 1 other, 2
+usage/input, 3 not found, 4 access unavailable, 5 ambiguous, 6 unsupported, 7 a person
+is needed. Recovery text and its numbering exist only in plain mode; JSON consumers get
+the same actions as structured `next` entries. `daemon`, `service` and `pair` answer
+`unsupported`. Usage errors are JSON in JSON mode; `--help` and `--version` stay text.
 
 ## Daemon setup
 
