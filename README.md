@@ -14,6 +14,15 @@ core at the exact revision recorded in `cli/Cargo.lock`; the first build needs n
 access. `just test` runs protocol, lifecycle and synthetic-vault tests; `just check` checks
 formatting and compilation.
 
+## NixOS installations
+
+When a NixOS or Home Manager configuration manages the daemon, its unit should point
+straight to the packaged executable (`bramble-cli daemon --desktop`). Do not also run
+`service install`: that command copies the binary for systems without declarative
+service management. Nix-managed upgrades must update the unit and restart its daemon;
+restarting discards manually unsealed keys. Desktop pairing stays in the user's data
+directory and is not part of the Nix store.
+
 ## Start the daemon
 
 ```sh
