@@ -61,10 +61,24 @@ impl Field {
     }
 }
 
+impl Field {
+    /// A field requested by `get`: a built-in name always means the built-in field, so a custom
+    /// field that shares one needs `field:NAME` (or `--custom-field`). Any other name is read as
+    /// a custom field, which keeps the common case short.
+    pub fn parse_selection(spec: &str) -> Result<Self, String> {
+        match Self::parse(spec) {
+            Err(_) if !spec.starts_with("field:") && !spec.trim().is_empty() => {
+                Ok(Self::Custom(spec.to_owned()))
+            }
+            other => other,
+        }
+    }
+}
+
 pub fn parse_fields(specs: &[String]) -> Result<Vec<Field>, String> {
     let mut fields = Vec::new();
     for spec in specs {
-        let field = Field::parse(spec)?;
+        let field = Field::parse_selection(spec)?;
         if !fields.contains(&field) {
             fields.push(field);
         }
@@ -527,11 +541,25 @@ mod tests {
     }
     #[test]
     fn rejects_unknown_selectors_and_deduplicates() {
+        // `--clear` stays strict so a typo cannot silently clear nothing.
         assert!(Field::parse("pasword")
             .unwrap_err()
             .contains("Choose one of"));
         assert!(Field::parse("field:").is_err());
+        assert!(Field::parse_selection("field:").is_err());
+        assert!(Field::parse_selection("  ").is_err());
         assert_eq!(fields(&["name", "title", "TITLE"]), [Field::Title]);
+    }
+    #[test]
+    fn bare_names_prefer_built_in_fields_and_fall_back_to_custom_ones() {
+        assert_eq!(fields(&["Password"]), [Field::Password]);
+        assert_eq!(fields(&["Region"]), [Field::Custom("Region".into())]);
+        assert_eq!(fields(&["API key"]), [Field::Custom("API key".into())]);
+        // The prefix reaches a custom field that shares a built-in name.
+        assert_eq!(fields(&["field:notes"]), [Field::Custom("notes".into())]);
+        assert_eq!(fields(&["Region", "field:Region"]).len(), 1);
+        let found = select(&login(), &fields(&["Region", "field:notes"]));
+        assert_eq!(found.unwrap_err(), ["field:notes"]);
     }
     #[test]
     fn update_preserves_everything_not_mentioned() {

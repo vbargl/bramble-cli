@@ -303,9 +303,27 @@ fn get_reports_missing_and_unknown_fields_without_partial_output() {
         "{}",
         err(&missing)
     );
+    // A name that is not built in is a custom field, so a typo reads as a missing field.
     let unknown = h.run(&["get", "full", "-f", "pasword"], None);
-    assert_eq!(unknown.status.code(), Some(2));
-    assert!(err(&unknown).contains("Choose one of"));
+    assert_eq!(unknown.status.code(), Some(3));
+    assert!(
+        err(&unknown).contains("no field:pasword"),
+        "{}",
+        err(&unknown)
+    );
+    // The bare name and --custom-field both reach a custom field.
+    assert_eq!(
+        text(&h.run(&["get", "full", "-f", "API key"], None)),
+        text(&h.run(&["get", "full", "--custom-field", "API key"], None))
+    );
+    let both = h.run(
+        &["get", "full", "-f", "username", "--custom-field", "API key"],
+        None,
+    );
+    assert!(text(&both).starts_with("username\t"), "{}", text(&both));
+    assert!(text(&both).contains("\nfield:API key\t"), "{}", text(&both));
+    let empty = h.run(&["get", "full", "--custom-field", ""], None);
+    assert_eq!(empty.status.code(), Some(2));
     // An empty value is still a value.
     assert_eq!(text(&h.run(&["get", "bare", "-f", "username"], None)), "\n");
     let notes = h.run(&["get", "bare", "-f", "url"], None);

@@ -119,7 +119,8 @@ bramble-cli list --hostname example.com
 bramble-cli get ENTRY_ID                      # the password, as before
 bramble-cli get ENTRY_ID -f username          # one field: just its value
 bramble-cli get ENTRY_ID -f title -f url      # several: NAME<TAB>VALUE per line
-bramble-cli get ENTRY_ID -f 'field:API key'   # a custom field, by exact name
+bramble-cli get ENTRY_ID -f 'API key'         # a custom field, by exact name
+bramble-cli get ENTRY_ID --custom-field notes # a custom field named like a built-in one
 ```
 
 `list` prints an aligned `ID  TITLE  VAULT` table across all unsealed vaults, sorted by
@@ -128,12 +129,15 @@ fit a terminal; redirected output is never shortened, and IDs never are. Use `--
 for machine-readable output. Neither `list` nor `get` requires a vault argument.
 
 `get` selects fields with repeatable `-f/--field`: `title`, `username`, `password`,
-`url` (the first), `urls` (all, one per line), `notes`, `totp` and `field:NAME` for a
-custom field. With no `-f` it prints only the password, exactly as before. One field
+`url` (the first), `urls` (all, one per line), `notes` and `totp`. Any other name is a
+custom field, matched exactly. A built-in name always means the built-in field, so reach
+a custom field that shares one with `--custom-field NAME` (or `-f field:NAME`).
+`--custom-field` only ever reads custom fields and its values print after the `-f`
+ones. With no `-f` it prints only the password, exactly as before. One field
 prints its bare value; several print `name<TAB>value` lines in the order requested, with
 newlines in values written as `\n` (use `--json` for exact values). A field the entry
 does not have is an error (`field_not_found`, exit 3) and prints nothing; an empty value
-is a value. Unknown field names are rejected. If a custom field name is duplicated in an
+is a value, and a misspelled name is reported as a missing custom field. If a custom field name is duplicated in an
 entry, the first is returned. Guidance and prompts go to stderr, so values stay usable
 in pipes.
 
