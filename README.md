@@ -1,5 +1,7 @@
 # bramble-cli
 
+Source and releases: [vbargl/bramble-cli](https://github.com/vbargl/bramble-cli).
+
 A single-user daemon that reads Bramble passwords. Start it independently of any vault,
 then use the unlocked desktop app or manually unseal one or more vault files. Queries
 search every unsealed vault. `seal` changes access to one vault in this daemon; it does
