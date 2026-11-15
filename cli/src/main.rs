@@ -77,10 +77,15 @@ enum Command {
     /// Find an entry across all unsealed vaults and print its password, or the chosen fields.
     Get {
         id: String,
-        /// Field to print: title, username, password, url, urls, notes, totp or field:NAME.
-        /// Repeat the option for several fields; the default is the password.
+        /// Field to print: title, username, password, url, urls, notes, totp, or the name of a
+        /// custom field. A built-in name always means the built-in field. Repeat the option
+        /// for several fields; the default is the password.
         #[arg(short, long = "field", value_name = "FIELD")]
         fields: Vec<String>,
+        /// Print the custom field with this exact name, even when it shares a built-in name.
+        /// Printed after the --field values.
+        #[arg(long = "custom-field", value_name = "NAME")]
+        custom_fields: Vec<String>,
     },
     /// Create an entry, or update the one named by ID; omitted fields are kept.
     Save(SaveArgs),
@@ -1167,7 +1172,12 @@ fn run(cli: Cli) -> Result<(), CliError> {
         }
         Command::Status => Request::Status,
         Command::List { hostname } => Request::List { hostname },
-        Command::Get { id, fields } => {
+        Command::Get {
+            id,
+            mut fields,
+            custom_fields,
+        } => {
+            fields.extend(custom_fields.iter().map(|name| format!("field:{name}")));
             get_fields = entry::parse_fields(&fields).map_err(invalid)?;
             // Without options the password is returned as before; JSON always names fields.
             let named = if fields.is_empty() && ctx.json {
