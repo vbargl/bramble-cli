@@ -1,6 +1,6 @@
 //! Vault-scoped access. The daemon serves requests serially; upstream's single VEK slot is
 //! populated only for one local operation and cleared on every exit, including errors.
-use crate::{desktop, fail, ok, read_vault, NextAction, Request, Response};
+use crate::{desktop, entry, fail, fail_code, ok, read_vault, save, NextAction, Request, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -10,7 +10,7 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Choice {
     pub path: PathBuf,
     pub name: String,
@@ -21,6 +21,7 @@ pub struct Choice {
 pub enum Purpose {
     Unseal,
     Seal,
+    Save,
     Catalog,
 }
 
@@ -120,7 +121,10 @@ impl Drop for ClearKey {
         vault_crypto::lock();
     }
 }
-fn with_key<T>(key: &str, operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+pub(crate) fn with_key<T>(
+    key: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     let _guard = ClearKey;
     vault_crypto::unlock_with_vek(key.to_owned()).map_err(|e| e.to_string())?;
     operation()
@@ -296,7 +300,7 @@ impl State {
         if open.len() == 1 {
             return Ok(open);
         }
-        if matches!(purpose, Purpose::Seal) {
+        if matches!(purpose, Purpose::Seal | Purpose::Save) {
             return Ok(open);
         }
         Ok(catalog
@@ -324,13 +328,18 @@ impl State {
                 match choices.as_slice() {
                     [choice] => return Ok(choice.path.clone()),
                     [] => {
-                        return Err(fail(format!(
-                            "Vault was not found: {text}. Use a listed name, ID or .vlt path."
-                        )))
+                        return Err(fail_code(
+                            "vault_not_found",
+                            format!(
+                                "Vault was not found: {text}. Use a listed name, ID or .vlt path."
+                            ),
+                        ))
                     }
                     _ => {
-                        let mut response =
-                            fail("Several vaults have that name. Choose a specific vault.");
+                        let mut response = fail_code(
+                            "ambiguous_vault",
+                            "Several vaults have that name. Choose a specific vault.",
+                        );
                         response.next = Some(NextAction::SelectVault);
                         response.choices = choices;
                         return Err(response);
@@ -342,8 +351,13 @@ impl State {
         let choices = self.choices(purpose).map_err(fail)?;
         match choices.as_slice() {
             [choice] => Ok(choice.path.clone()),
-            [] => Err(fail("No vault was found. Open or restore a vault in desktop Bramble, or supply its .vlt path to unseal.")),
-            _ => { let mut response=fail("Choose the vault to change."); response.next=Some(NextAction::SelectVault); response.choices=choices; Err(response) },
+            [] => Err(fail_code("vault_not_found", "No vault was found. Open or restore a vault in desktop Bramble, or supply its .vlt path to unseal.")),
+            _ => {
+                let mut response = fail_code("ambiguous_vault", "Several vaults are available. Choose the vault to change.");
+                response.next = Some(NextAction::SelectVault);
+                response.choices = choices;
+                Err(response)
+            }
         }
     }
     fn error(&self, e: String, path: Option<PathBuf>) -> Response {
@@ -440,7 +454,17 @@ impl State {
             .collect();
         ok(serde_json::to_string(&result).unwrap())
     }
-    fn get_all(&self, id: String) -> Response {
+    fn get_all(&self, id: String, fields: Vec<String>) -> Response {
+        // `get` without fields answers with the password alone, as it always has.
+        let legacy = fields.is_empty();
+        let selected = if legacy {
+            vec![entry::Field::Password]
+        } else {
+            match entry::parse_fields(&fields) {
+                Ok(selected) => selected,
+                Err(e) => return fail_code("invalid_input", e),
+            }
+        };
         let sources = match self.sources() {
             Ok(v) => v,
             Err(e) => return self.error(e, None),
@@ -473,35 +497,235 @@ impl State {
             {
                 continue;
             }
-            let entry = scoped.as_ref().map(|(_, id)| id.as_str()).unwrap_or(&id);
+            let entry_id = scoped.as_ref().map(|(_, id)| id.as_str()).unwrap_or(&id);
             let result = if let Some(key) = self.keys.get(path) {
-                with_key(key, || crate::get(&read_vault(path)?, entry))
+                with_key(key, || {
+                    crate::get_fields(&read_vault(path)?, entry_id, &selected)
+                })
+            } else if let Some(field) = selected.iter().find(|f| !f.desktop_supported()) {
+                Err(format!(
+                    "desktop supports only the username, password and totp fields, not {}",
+                    field.selector()
+                ))
             } else {
-                self.desktop_request(path, json!({"op":"fetch","id":entry}), false)
-                    .and_then(
-                        |mut answer| match answer.get_mut("password").map(Value::take) {
-                            Some(Value::String(password)) => Ok(password),
-                            _ => Err("desktop reply missing password".into()),
-                        },
-                    )
+                self.desktop_request(path, json!({"op":"fetch","id":entry_id}), false)
+                    .and_then(|mut answer| desktop_fields(&mut answer, &selected))
             };
             match result {
-                Ok(password) => found.push((path.clone(), Zeroizing::new(password))),
+                Ok(fields) => found.push((path.clone(), Zeroizing::new(fields.to_string()))),
                 Err(e) if e == "entry not found" || e == "desktop: unknown entry" => (),
                 Err(e) => return self.error(e, Some(path.clone())),
             }
         }
         match found.as_slice() {
             [] => self.error("entry not found".into(), None),
-            [(_, password)] => ok(password.as_str()),
-            _ => fail(format!(
-                "Entry ID exists in several vaults. Use a scoped ID from list:\n{}",
-                found
+            [(path, fields)] => {
+                let mut value: Value = serde_json::from_str(fields).unwrap_or_default();
+                if legacy {
+                    let password = value["password"].take();
+                    return ok(password.as_str().unwrap_or_default());
+                }
+                let mut response = ok("");
+                response.data = Some(json!({
+                    "id": id,
+                    "vault": self.display_name(path),
+                    "fields": value,
+                }));
+                response
+            }
+            _ => {
+                let ids: Vec<_> = found
                     .iter()
                     .map(|(path, _)| self.scoped(path, &id))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )),
+                    .collect();
+                let mut response = fail_code(
+                    "ambiguous_entry",
+                    format!(
+                        "Entry ID exists in several vaults. Use a scoped ID from list:\n{}",
+                        ids.join("\n")
+                    ),
+                );
+                response.data = Some(json!({ "ids": ids }));
+                response
+            }
+        }
+    }
+    fn display_name(&self, path: &Path) -> String {
+        self.catalog()
+            .into_iter()
+            .find(|v| v.path == path)
+            .map(|v| v.name)
+            .unwrap_or_else(|| fallback_name(path))
+    }
+    /// Is the vault currently open in a running, paired desktop? The desktop keeps its own
+    /// copy and sync state, so a file edited underneath it could be overwritten or diverge.
+    fn desktop_holds(&self, path: &Path) -> Result<bool, String> {
+        let Some((socket, identity)) = &self.desktop else {
+            return Ok(false);
+        };
+        let probe = json!({"op":"query","hostname":"bramble-cli-status.invalid"});
+        match self.current() {
+            Ok(current) if current != path => Ok(false),
+            Ok(_) => match desktop::request(socket, identity, probe) {
+                Ok(_) => Ok(true),
+                Err(e) if expected_unavailable(&e) => Ok(false),
+                Err(e) => Err(e),
+            },
+            // The active vault cannot be identified; only a desktop that answers is a risk.
+            Err(_) => match desktop::request(socket, identity, probe) {
+                Ok(_) => Err("desktop: cannot identify vault".into()),
+                Err(_) => Ok(false),
+            },
+        }
+    }
+    fn holders(&self, id: &str) -> Vec<PathBuf> {
+        self.keys
+            .iter()
+            .filter(|(path, key)| {
+                with_key(key, || {
+                    Ok(crate::entries(&read_vault(path)?)?
+                        .iter()
+                        .any(|e| e.get("id").and_then(Value::as_str) == Some(id)))
+                })
+                .unwrap_or(false)
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+    fn save_entry(
+        &self,
+        id: Option<String>,
+        vault: Option<PathBuf>,
+        mut change: entry::Change,
+    ) -> Response {
+        let response = self.save_inner(id, vault, &change);
+        change.wipe();
+        response
+    }
+    fn save_inner(
+        &self,
+        id: Option<String>,
+        vault: Option<PathBuf>,
+        change: &entry::Change,
+    ) -> Response {
+        let sources = match self.sources() {
+            Ok(v) => v,
+            Err(e) => return self.error(e, None),
+        };
+        if sources.is_empty() {
+            return self.inaccessible();
+        }
+        let scoped = id.as_deref().and_then(|id| {
+            sources
+                .iter()
+                .filter_map(|path| {
+                    id.strip_prefix(&format!("{}::", path.display()))
+                        .map(|entry| (path.clone(), entry.to_owned()))
+                })
+                .max_by_key(|(path, _)| path.as_os_str().len())
+        });
+        let explicit = match vault {
+            Some(vault) => match self.target(Some(vault), Purpose::Save) {
+                Ok(path) => Some(path),
+                Err(response) => return response,
+            },
+            None => None,
+        };
+        let (path, entry_id) = match (scoped, explicit, id) {
+            (Some((path, entry)), explicit, _) => {
+                if explicit.is_some_and(|chosen| chosen != path) {
+                    return fail_code(
+                        "invalid_input",
+                        "The entry ID names a different vault than --vault.",
+                    );
+                }
+                (path, Some(entry))
+            }
+            (None, Some(path), id) => (path, id),
+            (None, None, Some(id)) => {
+                let holders = self.holders(&id);
+                match holders.as_slice() {
+                    [path] => (path.clone(), Some(id)),
+                    [] if sources.iter().any(|p| !self.keys.contains_key(p)) => {
+                        let mut response = fail_code(
+                            "write_unsupported",
+                            "The entry was not found in a manually unsealed vault, and desktop access is read-only.",
+                        );
+                        response.next = Some(NextAction::ManualUnseal);
+                        return response;
+                    }
+                    [] => return self.error("entry not found".into(), None),
+                    _ => {
+                        let ids: Vec<_> = holders.iter().map(|p| self.scoped(p, &id)).collect();
+                        let mut response = fail_code(
+                            "ambiguous_entry",
+                            format!(
+                                "Entry ID exists in several vaults. Use a scoped ID from list:\n{}",
+                                ids.join("\n")
+                            ),
+                        );
+                        response.data = Some(json!({ "ids": ids }));
+                        return response;
+                    }
+                }
+            }
+            (None, None, None) => match self.target(None, Purpose::Save) {
+                Ok(path) => (path, None),
+                Err(response) => return response,
+            },
+        };
+        if !sources.contains(&path) {
+            return self.error("daemon is sealed".into(), Some(path));
+        }
+        let name = self.display_name(&path);
+        let Some(key) = self.keys.get(&path) else {
+            let mut response = fail_code(
+                "write_unsupported",
+                format!("{name} is open through desktop access, which is read-only. Unseal it manually to save entries."),
+            );
+            response.next = Some(NextAction::ManualUnseal);
+            response.vault = Some(path);
+            return response;
+        };
+        match self.desktop_holds(&path) {
+            Ok(false) => (),
+            Ok(true) => {
+                let mut response = fail_code(
+                    "desktop_active",
+                    format!("{name} is open in desktop Bramble. Saving to its file now could be overwritten or diverge from its sync state."),
+                );
+                response.next = Some(NextAction::LockDesktop);
+                response.vault = Some(path);
+                return response;
+            }
+            Err(e) => return self.error(e, Some(path)),
+        }
+        match save::save(&path, key, entry_id.as_deref(), change) {
+            Ok(saved) => {
+                // Qualify the ID when another unsealed vault holds the same one.
+                let id = if self.holders(&saved.id).len() > 1 {
+                    self.scoped(&path, &saved.id)
+                } else {
+                    saved.id
+                };
+                let mut response = ok("");
+                response.vault = Some(path);
+                response.data = Some(json!({
+                    "id": id,
+                    "vault": name,
+                    "created": saved.created,
+                    "changed": saved.changed,
+                }));
+                response
+            }
+            Err(e) => {
+                let mut response = fail_code(e.code, e.message);
+                if e.code == "entry_not_found" {
+                    response.next = Some(NextAction::SelectEntry);
+                }
+                response.vault = Some(path);
+                response
+            }
         }
     }
     pub fn handle(&mut self, req: Request) -> Response {
@@ -529,6 +753,7 @@ impl State {
                                 response.message
                             )
                         };
+                        response.choices = self.choices(Purpose::Catalog).unwrap_or_default();
                         return response;
                     }
                 };
@@ -568,6 +793,7 @@ impl State {
                     response.next = blocked.next;
                     response.vault = blocked.vault;
                 }
+                response.choices = self.choices(Purpose::Catalog).unwrap_or_default();
                 response
             }
             Request::Seal { vault } => {
@@ -647,7 +873,8 @@ impl State {
                 }
             }
             Request::List { hostname } => self.list_all(hostname),
-            Request::Get { id } => self.get_all(id),
+            Request::Get { id, fields } => self.get_all(id, fields),
+            Request::Save { id, vault, change } => self.save_entry(id, vault, change),
         }
     }
 }
@@ -667,4 +894,30 @@ fn expected_unavailable(e: &str) -> bool {
                 | "desktop: not linked to the open vault"
                 | "daemon is sealed"
         )
+}
+
+/// The requested fields from a desktop `fetch` answer, which holds only username,
+/// password and totp. Leftover secrets in the answer are wiped.
+fn desktop_fields(answer: &mut Value, selected: &[entry::Field]) -> Result<Value, String> {
+    let mut found = serde_json::Map::new();
+    let mut missing = Vec::new();
+    for field in selected {
+        let key = match field {
+            entry::Field::Username => "username",
+            entry::Field::Totp => "totp",
+            _ => "password",
+        };
+        match answer.get_mut(key).map(Value::take) {
+            Some(Value::String(value)) => {
+                found.insert(field.selector(), Value::String(value));
+            }
+            _ => missing.push(field.selector()),
+        }
+    }
+    entry::wipe(answer);
+    if missing.is_empty() {
+        Ok(Value::Object(found))
+    } else {
+        Err(format!("field not found: {}", missing.join(", ")))
+    }
 }
