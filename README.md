@@ -123,8 +123,8 @@ bramble-cli get ENTRY_ID -f 'API key'         # a custom field, by exact name
 bramble-cli get ENTRY_ID --custom-field notes # a custom field named like a built-in one
 ```
 
-`list` prints an aligned `ID  TITLE  VAULT` table across all unsealed vaults, sorted by
-vault and title. It never shows secret values. Titles and vault names are shortened to
+`list` prints an aligned `TITLE  VAULT  ID` table across all unsealed vaults, sorted by
+title. It never shows secret values. Titles and vault names are shortened to
 fit a terminal; redirected output is never shortened, and IDs never are. Use `--json`
 for machine-readable output. Neither `list` nor `get` requires a vault argument.
 

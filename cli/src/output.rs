@@ -216,9 +216,16 @@ pub fn terminal_width() -> Option<usize> {
         .or(Some(80))
 }
 
-/// Aligned `ID  TITLE  VAULT` rows. IDs are the handle for `get` and `save`, so they are
-/// never shortened; long titles and vault names are, but only to fit a terminal.
-pub fn entry_table(rows: &[(String, String, String)], width: Option<usize>) -> String {
+/// Aligned `TITLE  VAULT  ID` rows, in the order a reader needs them: the title identifies
+/// the entry, the vault tells similar titles apart, and the ID is the handle for `get` and
+/// `save`, so it comes last where it never forces the other columns out of line. IDs are
+/// never shortened; long titles and vault names are, but only to fit a terminal. `styled`
+/// adds emphasis only: bold title, plain vault, dimmed ID and header.
+pub fn entry_table(
+    rows: &[(String, String, String)],
+    width: Option<usize>,
+    styled: bool,
+) -> String {
     const GAP: usize = 2;
     let rows: Vec<_> = rows
         .iter()
@@ -246,17 +253,45 @@ pub fn entry_table(rows: &[(String, String, String)], width: Option<usize>) -> S
             title_width = title_width.min(room.saturating_sub(vault_width).max(8));
         }
     }
-    let line = |id: &str, title: &str, vault: &str| {
-        let text = format!(
-            "{id:<id_width$}{gap}{title:<title_width$}{gap}{vault}",
-            title = shorten(title, title_width),
-            vault = shorten(vault, vault_width),
-            gap = " ".repeat(GAP)
-        );
-        text.trim_end().to_owned()
+    // Pad the plain text first so escape sequences never disturb the alignment.
+    let cell = |text: &str, width: usize, style: Option<&str>| {
+        let padded = format!("{:<width$}", shorten(text, width));
+        match style.filter(|_| styled) {
+            Some(code) => terminal::style(code, &padded),
+            None => padded,
+        }
     };
-    let mut out = vec![line("ID", "TITLE", "VAULT")];
-    out.extend(rows.iter().map(|(id, title, vault)| line(id, title, vault)));
+    let gap = " ".repeat(GAP);
+    let line = |title: &str, vault: &str, id: &str, title_style, vault_style, id_style| {
+        let id = match id_style {
+            Some(code) if styled => terminal::style(code, id),
+            _ => id.to_owned(),
+        };
+        let head = format!(
+            "{}{gap}{}{gap}",
+            cell(title, title_width, title_style),
+            cell(vault, vault_width, vault_style)
+        );
+        format!("{head}{id}")
+    };
+    let mut out = vec![line(
+        "TITLE",
+        "VAULT",
+        "ID",
+        Some(terminal::DIM),
+        Some(terminal::DIM),
+        Some(terminal::DIM),
+    )];
+    out.extend(rows.iter().map(|(id, title, vault)| {
+        line(
+            title,
+            vault,
+            id,
+            Some(terminal::BOLD),
+            None,
+            Some(terminal::DIM),
+        )
+    }));
     out.join("\n")
 }
 
@@ -276,30 +311,47 @@ mod tests {
                 row("long-entry-id", "Bank", "Work"),
             ],
             None,
+            false,
         );
         assert_eq!(
             table,
-            "ID             TITLE   VAULT\na              GitHub  Personal\nlong-entry-id  Bank    Work"
+            "TITLE   VAULT     ID\nGitHub  Personal  a\nBank    Work      long-entry-id"
         );
     }
     #[test]
     fn table_shortens_titles_only_when_a_width_is_known() {
         let rows = [row("id-1", &"x".repeat(60), "Personal")];
-        assert!(entry_table(&rows, None).contains(&"x".repeat(60)));
-        let narrow = entry_table(&rows, Some(40));
+        assert!(entry_table(&rows, None, false).contains(&"x".repeat(60)));
+        let narrow = entry_table(&rows, Some(40), false);
         assert!(narrow.lines().all(|l| l.chars().count() <= 40), "{narrow}");
         assert!(narrow.contains('…'));
         assert!(narrow.contains("id-1"));
     }
     #[test]
     fn table_strips_terminal_control_sequences_from_titles() {
-        let table = entry_table(&[row("id", "evil\x1b[31m\ntitle", "v")], None);
+        let table = entry_table(&[row("id", "evil\x1b[31m\ntitle", "v")], None, false);
         assert!(!table.contains('\x1b'));
         assert_eq!(table.lines().count(), 2);
     }
     #[test]
+    fn styled_table_emphasises_titles_and_dims_handles_without_breaking_alignment() {
+        let rows = [
+            row("id-1", "Bank", "Work"),
+            row("id-2", "GitHub", "Personal"),
+        ];
+        let styled = entry_table(&rows, None, true);
+        assert!(styled.contains("\x1b[1mBank  \x1b[0m"), "{styled:?}");
+        assert!(styled.contains("\x1b[2mid-1\x1b[0m"));
+        assert!(styled.lines().next().unwrap().starts_with("\x1b[2mTITLE"));
+        // Stripping the emphasis leaves exactly the plain table.
+        let stripped = ["\x1b[1m", "\x1b[2m", "\x1b[0m"]
+            .iter()
+            .fold(styled, |text, code| text.replace(code, ""));
+        assert_eq!(stripped, entry_table(&rows, None, false));
+    }
+    #[test]
     fn empty_table_is_just_the_header() {
-        assert_eq!(entry_table(&[], None), "ID  TITLE  VAULT");
+        assert_eq!(entry_table(&[], None, false), "TITLE  VAULT  ID");
     }
     #[test]
     fn errors_serialize_with_a_code_steps_and_choices() {
