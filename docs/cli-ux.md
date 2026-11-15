@@ -47,9 +47,9 @@ socket and connection options in suggested follow-up commands.
   bare duplicate entry ID; list supplies source-qualified IDs for that case.
 - `get ID [-f FIELD]...` prints the password by default, one field's bare value, or
   `name<TAB>value` lines in request order. A missing field is an error with no partial
-  output; an empty value is a value. `list` prints an aligned `ID  TITLE  VAULT` table
+  output; an empty value is a value. `list` prints an aligned `TITLE  VAULT  ID` table
   without secrets: IDs are never shortened, titles and vault names are shortened only for
-  a terminal. Neither styles stdout.
+  a terminal. Stdout is styled only on a capable terminal (see Visual hierarchy).
 - `save [ID]` creates (title required) or updates, keeping every field not named.
   Clearing is only explicit (`--clear`). It prints the entry ID on stdout and a short
   result on stderr. It never replays a request, because the request carries secrets.
@@ -68,8 +68,38 @@ socket and connection options in suggested follow-up commands.
 - Do not label every instruction with an hourglass. Use waiting indicators only for
   actual waits; ordinary user actions remain plain text. Keep success/results distinct
   from errors, and do not print routine connection events or duplicate checklists.
-- Honor `NO_COLOR`, `TERM=dumb` and stderr's own TTY state. Hierarchy must still work
-  without color, and application data on stdout is never styled.
+- Honor `NO_COLOR`, `TERM=dumb` and the TTY state of the stream being written. Hierarchy
+  must still work without styling: position, spacing and wording carry it, emphasis only
+  reinforces it. Stdout is styled only when it is a capable terminal; a pipe or file always
+  receives the plain text.
+
+## Visual hierarchy
+
+Based on Figma's [visual hierarchy guide](https://www.figma.com/resource-library/what-is-visual-hierarchy/):
+rank the information first, then express the rank with the few tools the medium has. A
+terminal has no size or texture and little colour, so the principles translate like this.
+
+| Principle | In the terminal |
+| --- | --- |
+| Size | Unavailable. Position replaces it: the first column and the first line are read first. |
+| Contrast | Three levels of emphasis only: bold (read this first), plain, dim (chrome and handles). Red marks the one problem line. Emphasis never changes the words. |
+| Alignment | Columns are padded on the plain text, so styling cannot shift them. Recovery actions share one indent. |
+| Proximity | A command stays directly under the sentence that introduces it; alternatives are separated by blank lines and `-- or --`. |
+| Time | Output order is reading order: the problem, then what to do, then the command. |
+| A little goes a long way | One bold element per row or block. Everything bold would make nothing stand out. |
+| Progressive disclosure | Plain mode shows the problem and next action; `--json` carries structure; `--help` carries detail. |
+
+Importance of each piece of data, most important first:
+
+| Output | Primary (bold, leftmost) | Secondary (plain) | Tertiary (dim) |
+| --- | --- | --- | --- |
+| `list` row | Title: how a person recognises the entry | Vault: tells similar titles apart | ID: a handle to copy, never read; last so it cannot misalign the others; header row |
+| `get` with several fields | The value: what was asked for | | Field label |
+| Error | The problem line (`!`, bold red) | The sentence introducing each action | `-- or --` separators |
+| Error action | The command to run (bold, indented under its sentence) | | |
+
+Single-field `get`, `save` results and everything in `--json` stay unstyled: they are data
+for the next program, not for a reader.
 
 ## JSON mode
 

@@ -411,7 +411,7 @@ fn list_prints_an_aligned_table_without_secret_values() {
     let table = text(&output);
     assert_eq!(
         table,
-        "ID    TITLE    VAULT\nbare  Bare     Personal\nfull  Example  Personal\nmemo  Memo     Personal\n"
+        "TITLE    VAULT     ID\nBare     Personal  bare\nExample  Personal  full\nMemo     Personal  memo\n"
     );
     for secret in ["s3cret", "bare-pass", "k-1", "JBSWY3DP", "remember"] {
         assert!(!table.contains(secret), "{secret} leaked");
@@ -440,7 +440,7 @@ fn list_qualifies_duplicate_ids_and_names_each_vault() {
     assert!(table.contains(&format!("{}::shared", b.display())));
     assert!(table
         .lines()
-        .any(|l| l.starts_with("only-work") && l.ends_with("Work")));
+        .any(|l| l.contains("Work") && l.ends_with("only-work")));
 }
 
 #[test]

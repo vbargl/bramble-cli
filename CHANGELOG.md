@@ -4,7 +4,7 @@
 
 - `get` selects fields: title, username, password, URLs, notes, one-time-password secret
   and custom fields. Without options it still prints only the password.
-- `list` prints an aligned `ID  TITLE  VAULT` table and never shows secret values.
+- `list` prints an aligned `TITLE  VAULT  ID` table and never shows secret values.
   **Breaking:** it no longer prints a JSON array by default; use `--json`.
 - `save` creates a login or updates one by ID, keeping omitted fields, with explicit
   `--clear`. It writes only manually unsealed vaults, atomically and with read-back

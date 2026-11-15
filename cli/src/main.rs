@@ -1289,11 +1289,17 @@ fn print_get(
     let text = if let [only] = fields {
         shown(&data["fields"][only.selector()])
     } else {
+        // The value is what was asked for; its label is only a guide, so it is dimmed.
+        let styled = !ctx.json && terminal::stdout_styled();
         fields
             .iter()
             .map(|f| {
                 let value = shown(&data["fields"][f.selector()]);
-                format!("{}\t{}", f.selector(), value.replace('\n', "\\n"))
+                let label = match styled {
+                    true => terminal::style(terminal::DIM, &f.selector()),
+                    false => f.selector(),
+                };
+                format!("{label}\t{}", value.replace('\n', "\\n"))
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -1321,14 +1327,18 @@ fn print_list(ctx: &Ctx, response: &mut Response, socket: &Path) -> Result<(), C
             (field("id"), field("name"), field("vault"))
         })
         .collect();
+    // The title leads each row, so that is the order a reader scans.
     rows.sort_by_cached_key(|(id, title, vault)| {
-        (vault.to_lowercase(), title.to_lowercase(), id.clone())
+        (title.to_lowercase(), vault.to_lowercase(), id.clone())
     });
     if rows.is_empty() {
         eprintln!("No entries.");
         return Ok(());
     }
-    println!("{}", output::entry_table(&rows, output::terminal_width()));
+    println!(
+        "{}",
+        output::entry_table(&rows, output::terminal_width(), terminal::stdout_styled())
+    );
     Ok(())
 }
 use std::io::Read;

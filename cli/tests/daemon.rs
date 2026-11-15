@@ -895,7 +895,15 @@ fn error_hierarchy_is_readable_in_colored_plain_and_dumb_terminals() {
         if !colored {
             assert!(!text.contains('\x1b'));
         }
-        let plain = text.replace("\x1b[1;31m", "").replace("\x1b[0m", "");
+        assert_eq!(
+            text.contains("\x1b[1m    "),
+            colored,
+            "commands are bold: {text:?}"
+        );
+        assert_eq!(text.contains("\x1b[2m  -- or --"), colored, "{text:?}");
+        let plain = ["\x1b[1;31m", "\x1b[1m", "\x1b[2m", "\x1b[0m"]
+            .iter()
+            .fold(text.clone(), |text, code| text.replace(code, ""));
         let lines: Vec<_> = plain.lines().collect();
         assert_eq!(lines.len(), 9, "{plain}");
         assert_eq!(lines[0], "! Daemon service is not installed.");
